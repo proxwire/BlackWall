@@ -1,0 +1,5 @@
+*
+!docker/
+!lab/
+!rules/
+lab/**/__pycache__

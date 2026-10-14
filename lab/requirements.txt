@@ -1,0 +1,14 @@
+pyghidra-mcp==0.2.7
+mcp-proxy==0.13.0
+mcp[cli]>=1.27.1,<2
+speakeasy-emulator==2.0.0b9
+pefile==2024.8.26
+lief==1.0.0
+dnfile==0.18.0
+yara-python==4.5.4
+capstone
+unicorn>=2.1.4
+pycryptodome
+ppdeep
+py-tlsh
+httpx

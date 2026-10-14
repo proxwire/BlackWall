@@ -1,0 +1,58 @@
+#!/opt/venv/bin/python3
+"""Run an stdio MCP server and make sure it dies with its client.
+
+`docker exec -i` delivers EOF on stdin when the client goes away, but servers
+with non-daemon threads (the Ghidra JVM) keep running and keep the project
+locked. This proxies stdin to the child; on EOF it closes the child's stdin,
+then escalates SIGINT (pyghidra-mcp: save and close) -> SIGTERM -> SIGKILL.
+
+usage: bw-stdio-guard <cmd> [args...]
+"""
+
+import os
+import signal
+import subprocess
+import sys
+import threading
+
+child = subprocess.Popen(sys.argv[1:], stdin=subprocess.PIPE, stdout=sys.stdout, stderr=sys.stderr)
+
+
+def pump():
+    src = sys.stdin.buffer
+    try:
+        while True:
+            chunk = src.read1(65536)
+            if not chunk:
+                break
+            child.stdin.write(chunk)
+            child.stdin.flush()
+    except (BrokenPipeError, ValueError):
+        pass
+    finally:
+        try:
+            child.stdin.close()
+        except Exception:
+            pass
+    for sig, wait in ((None, 5), (signal.SIGINT, 30), (signal.SIGTERM, 10), (signal.SIGKILL, 5)):
+        if sig is not None and child.poll() is None:
+            child.send_signal(sig)
+        try:
+            child.wait(timeout=wait)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+
+
+def forward(signum, _frame):
+    if child.poll() is None:
+        child.send_signal(signum)
+
+
+for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+    signal.signal(s, forward)
+
+t = threading.Thread(target=pump, daemon=True)
+t.start()
+rc = child.wait()
+os._exit(rc if rc >= 0 else 128 - rc)

@@ -1,0 +1,36 @@
+#!/bin/bash
+# Prepare /work for a case: home dir, caches, and the extracted sample.
+# The sample only ever exists unzipped inside this container's /work volume.
+set -euo pipefail
+
+mkdir -p /work/home/.cache /work/samples/original /work/samples/derived /work/out /work/ghidra /work/scratch
+[ -L /work/home/.cache/chroma ] || ln -s "$CHROMA_CACHE" /work/home/.cache/chroma
+
+zip=/case/sample.zip
+expected=${1:-}
+if [ ! -f "$zip" ]; then
+  echo "bw-init: $zip missing" >&2; exit 1
+fi
+
+if [ -z "$(ls -A /work/samples/original)" ]; then
+  tmp=$(mktemp -d /work/scratch/extract.XXXX)
+  7z x -y -p"${BW_ZIP_PASSWORD:-infected}" -o"$tmp" "$zip" >/dev/null
+  mapfile -t files < <(find "$tmp" -type f)
+  if [ "${#files[@]}" -ne 1 ]; then
+    echo "bw-init: expected exactly one file in sample.zip, found ${#files[@]}" >&2
+    printf '  %s\n' "${files[@]#$tmp/}" >&2
+    exit 1
+  fi
+  actual=$(sha256sum "${files[0]}" | cut -d' ' -f1)
+  if [ -n "$expected" ] && [ "$actual" != "$expected" ]; then
+    echo "bw-init: sha256 mismatch: zip contains $actual, case is $expected" >&2
+    exit 1
+  fi
+  # Name the working copy by hash; keep the original name as metadata only.
+  name=$(basename "${files[0]}")
+  mv "${files[0]}" "/work/samples/original/$actual"
+  chmod 0444 "/work/samples/original/$actual"
+  printf '{"sha256": "%s", "original_name": %s}\n' "$actual" "$(jq -Rn --arg n "$name" '$n')" > /work/samples/original/.meta.json
+  rm -rf "$tmp"
+fi
+ls -1 /work/samples/original

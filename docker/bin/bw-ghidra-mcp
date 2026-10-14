@@ -1,0 +1,46 @@
+#!/bin/bash
+# Ghidra MCP over stdio. With --gui, run pyghidra-mcp with the Ghidra GUI
+# (needs streamable-http) and bridge it to stdio with mcp-proxy. The HTTP
+# listener lives on 127.0.0.1 inside a --network none netns, so nothing
+# outside this container can reach it.
+set -euo pipefail
+args=(--project-path /work/ghidra --project-name case)
+mapfile -t samples < <(find /work/samples/original -maxdepth 1 -type f ! -name '.*')
+
+# Ghidra locks the project exclusively. A server whose client went away
+# uncleanly (killed `docker exec`, crashed session) keeps running inside the
+# container and holds that lock, so the newest session wins: ask old servers
+# to save and exit (SIGINT = clean save-and-close), then force, then clear
+# a lock nobody holds.
+PYG='^/opt/venv/bin/python3 /opt/venv/bin/pyghidra-mcp'
+evict_stale() {  # $1: regex of servers to stop
+  pkill -INT -f "$1" || return 0
+  for _ in $(seq 1 30); do
+    pgrep -f "$1" >/dev/null || return 0
+    sleep 1
+  done
+  pkill -KILL -f "$1" || true
+  sleep 1
+}
+clear_dead_lock() {
+  pgrep -f "$PYG" >/dev/null || rm -f /work/ghidra/case.lock /work/ghidra/case.lock~
+}
+
+if [ "${1:-}" = "--gui" ]; then
+  port=8000
+  evict_stale "$PYG.* -t stdio"   # a GUI server persists across sessions; headless ones don't
+  clear_dead_lock
+  if ! curl -s -o /dev/null "http://127.0.0.1:$port/mcp"; then
+    nohup pyghidra-mcp "${args[@]}" --gui -t streamable-http -p $port "${samples[@]}" \
+      > /work/out/pyghidra-mcp-gui.log 2>&1 &
+    for _ in $(seq 1 180); do
+      curl -s -o /dev/null "http://127.0.0.1:$port/mcp" && break
+      sleep 1
+    done
+  fi
+  exec bw-stdio-guard mcp-proxy --transport streamablehttp "http://127.0.0.1:$port/mcp"
+fi
+
+evict_stale "$PYG"
+clear_dead_lock
+exec bw-stdio-guard pyghidra-mcp "${args[@]}" -t stdio "${samples[@]}" 2>>/work/out/pyghidra-mcp.log

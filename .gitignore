@@ -1,0 +1,9 @@
+.env
+cases/
+__pycache__/
+*.pyc
+# never commit samples
+*.zip
+*.exe
+*.dll
+*.bin

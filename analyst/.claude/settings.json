@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__ghidra",
+      "mcp__lab",
+      "mcp__radare2",
+      "mcp__intel",
+      "Read",
+      "Glob",
+      "Grep",
+      "Edit(./**)",
+      "Write(./**)",
+      "WebSearch"
+    ],
+    "deny": [
+      "Bash",
+      "WebFetch",
+      "Read(./sample.zip)",
+      "Read(./exports/**)"
+    ]
+  }
+}

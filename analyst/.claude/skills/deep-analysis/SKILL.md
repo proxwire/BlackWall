@@ -1,0 +1,48 @@
+---
+name: deep-analysis
+description: Systematic function-level reverse engineering of a (unpacked) malware sample with Ghidra MCP — map components, resolve obfuscation, annotate the Ghidra project, and document behaviour with evidence.
+---
+
+# Deep analysis
+
+## 1. Map, then dive
+- Start from the entry point / `main` / exports / TLS callbacks and walk the
+  call graph (`ghidra.gen_callgraph`) two or three levels deep. Draft a
+  component map in `notes/findings.md`: init, anti-analysis, persistence,
+  config, C2 loop, command handlers, payload logic.
+- Seed priorities from the capa addresses and from xrefs to key imports and
+  strings (`ghidra.list_xrefs`, `ghidra.search_strings`, `ghidra.search_code`).
+
+## 2. Per function
+1. `ghidra.decompile_function` (include callees/xrefs when useful).
+2. Work out its purpose, then **write it back**:
+   - `rename_function` with verb-first names (`decrypt_config`, `c2_send_beacon`)
+   - `rename_variable`, `set_variable_type`, `set_function_prototype`
+   - `set_comment` with a one-line summary plus anything non-obvious
+3. Move bottom-up: annotating leaf helpers first makes their callers readable.
+4. Skip CRT/compiler/library code once you recognize it; give it a name like
+   `lib_memcpy` and move on.
+
+## 3. Obfuscation playbook
+- **String encryption.** Find the decrypt routine, reimplement it in
+  `lab.run_python`, decrypt every call site's arguments (collect them from
+  xrefs), and add each plaintext as a comment at its call site.
+- **API hashing.** Identify the algorithm (ROR13, CRC32, djb2, FNV-1a, custom),
+  hash export names from common DLLs in `run_python` (or reuse the Speakeasy
+  trace), then rename the resolved function-pointer globals.
+- **Control-flow flattening / opaque predicates.** Note them, focus on the
+  data flow, and cross-check with radare2 (`radare2` tools) when the decompiler
+  struggles.
+- **Crypto.** Identify algorithms by constants (AES S-box, RC4 KSA, ChaCha
+  `expand 32-byte k`, CRC tables, RSA/BCrypt/CryptoAPI imports). Record the
+  key's origin.
+
+## 4. Behaviour checklist (report confirmed / likely / not seen)
+Execution flow and anti-analysis · persistence · privilege escalation ·
+defense evasion · injection · credential access · discovery · lateral movement ·
+collection · C2 (protocol, encoding, beacon format, commands) ·
+exfiltration · impact (encryption, wiping, mining) · self-deletion/update.
+
+## 5. Checkpoints
+After each component, append to `notes/findings.md` with addresses and
+evidence. If your context gets long, summarize there before moving on.
