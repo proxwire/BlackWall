@@ -3,9 +3,10 @@ name = "blackwall-lab"
 version = "0.1.0"
 description = "BlackWall in-sandbox MCP servers"
 requires-python = ">=3.10"
+license = "MIT"
 
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools==84.2.0"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]

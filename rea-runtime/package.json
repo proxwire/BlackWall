@@ -1,0 +1,10 @@
+{
+  "name": "blackwall-rea-runtime",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Pinned REA runtime used inside the BlackWall analysis container",
+  "license": "MIT",
+  "dependencies": {
+    "rea-agents": "6.7.0"
+  }
+}

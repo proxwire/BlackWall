@@ -12,6 +12,16 @@ description: Systematic function-level reverse engineering of a (unpacked) malwa
   config, C2 loop, command handlers, payload logic.
 - Seed priorities from the capa addresses and from xrefs to key imports and
   strings (`ghidra.list_xrefs`, `ghidra.search_strings`, `ghidra.search_code`).
+- After identifying a high-value native function, use
+  `lab.rea_native_function` for a second, evidence-oriented dossier. Use
+  `lab.rea_native_trace` for visible feature strings/symbols and
+  `lab.rea_native_value_flow` selectively for crypto, config, C2, persistence,
+  injection, or command dispatch. Feed useful conclusions back into the
+  persistent Ghidra project; REA's temporary Ghidra project is not a substitute
+  for BlackWall annotations.
+- For .NET and APK targets, use the focused `lab.rea_managed_members` or
+  `lab.rea_android_*` static tools to identify relevant types/methods and CIL
+  or source anchors before drilling down. Never call REA's runtime commands.
 
 ## 2. Per function
 1. `ghidra.decompile_function` (include callees/xrefs when useful).

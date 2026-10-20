@@ -1,0 +1,86 @@
+name: CI
+
+"on":
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  source-and-dependencies:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install check tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends python3-venv shellcheck
+          python3 -m venv "${RUNNER_TEMP}/blackwall-checks"
+          "${RUNNER_TEMP}/blackwall-checks/bin/pip" install --disable-pip-version-check \
+            bandit==1.9.4 pip-audit==2.10.1 ruff==0.17.1 uv==0.12.21
+          echo "${RUNNER_TEMP}/blackwall-checks/bin" >> "${GITHUB_PATH}"
+
+      - name: Check source
+        run: |
+          bash -n blackwall docker/bin/bw-ghidra-mcp docker/bin/bw-init \
+            docker/bin/bw-intel-mcp docker/bin/bw-lab-mcp docker/bin/bw-r2mcp
+          shellcheck -e SC1091 blackwall docker/bin/bw-ghidra-mcp \
+            docker/bin/bw-init docker/bin/bw-intel-mcp docker/bin/bw-lab-mcp \
+            docker/bin/bw-r2mcp
+          python3 -m compileall -q lab
+          ruff check --select F,I,B lab
+          bandit -q -r -lll lab/blackwall_lab
+          git diff --check "$(git hash-object -t tree /dev/null)" HEAD
+
+      - name: Verify Python lock
+        run: |
+          uv pip compile lab/requirements.txt \
+            --python-version 3.12 \
+            --python-platform x86_64-unknown-linux-gnu \
+            --generate-hashes --no-emit-index-url \
+            --output-file lab/requirements.lock
+          git diff --exit-code -- lab/requirements.lock
+
+      - name: Audit dependencies
+        run: |
+          pip-audit -r lab/requirements.lock \
+            --ignore-vuln PYSEC-2026-311 \
+            --ignore-vuln PYSEC-2026-3813 \
+            --ignore-vuln PYSEC-2026-3814 \
+            --ignore-vuln PYSEC-2026-3815
+
+  image:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build image
+        run: |
+          docker build --build-arg UID="$(id -u)" --build-arg GID="$(id -g)" \
+            -t blackwall:ci -f docker/Dockerfile .
+
+      - name: Test image
+        run: |
+          docker run --rm --network none -e HOME=/tmp blackwall:ci \
+            python -m unittest discover -v -s /opt/blackwall/lab/tests
+          docker run --rm --network none blackwall:ci \
+            python -c 'from blackwall_lab.server import _validate_rea_command_manifest as validate; validate()'
+          docker run --rm --network none blackwall:ci python -m pip check
+          docker run --rm blackwall:ci \
+            npm audit --prefix /opt/rea/runtime --omit=dev
+          docker run --rm --network none blackwall:ci sh -c \
+            '/opt/rea/runtime/node_modules/.bin/rea inspect-go-binary /bin/true --format json | jq -e . >/dev/null'

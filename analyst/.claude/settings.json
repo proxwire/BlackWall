@@ -9,12 +9,12 @@
       "Glob",
       "Grep",
       "Edit(./**)",
-      "Write(./**)",
-      "WebSearch"
+      "Write(./**)"
     ],
     "deny": [
       "Bash",
       "WebFetch",
+      "WebSearch",
       "Read(./sample.zip)",
       "Read(./exports/**)"
     ]

@@ -9,17 +9,20 @@ summarized in the tool result.
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import math
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
 import time
 from collections import Counter
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from mcp.server.fastmcp import FastMCP
 
@@ -30,6 +33,58 @@ OUT = WORK / "out"
 CASE = Path("/case")
 RULES = Path("/opt/blackwall/rules")
 MAX_RESULT = 40_000
+REA_BIN = os.environ.get(
+    "BLACKWALL_REA_BIN", "/opt/rea/runtime/node_modules/.bin/rea",
+)
+
+# Deliberately narrow. REA also ships process, debugger, Frida, ADB, browser,
+# and other runtime capabilities. Those are not exposed in this container: a
+# container is an analysis boundary, not a safe native detonation boundary.
+REA_STATIC_WORKFLOWS = {
+    "artifact": "inspect-artifact",
+    "pe_resources": "inspect-pe-resources",
+    "go": "inspect-go-binary",
+    "rust": "inspect-rust-binary",
+    "wasm": "inspect-wasm-artifact",
+    "managed": "inspect-managed-artifact",
+    "managed_members": "inspect-managed-members",
+    "managed_native_boundaries": "inspect-managed-native-boundaries",
+    "javascript": "analyze-javascript-application",
+    "electron_fuses": "inspect-electron-fuses",
+    "android": "inspect-android-package",
+    "flutter": "identify-flutter-build",
+    "dart_aot": "inspect-dart-aot",
+    "pcap": "inspect-pcap-capture",
+    "sqlite": "inspect-sqlite-database",
+    "interface_builder": "decode-interface-builder",
+    "keyed_archive": "inspect-keyed-archive",
+    "dylib_resolution": "trace-dylib-resolution",
+}
+REA_EVM_ENCODINGS = {"raw", "hex"}
+REA_WEB_CAPTURE_FORMATS = {"har", "mitmproxy", "saz", "qlog"}
+REA_OBJDUMP_OPERATIONS = {
+    "file_headers", "section_headers", "symbols", "relocations", "dwarf",
+    "disassemble", "disassemble_all",
+}
+REA_NATIVE_COMMANDS = {
+    "analyze",
+    "function",
+    "inspect-native-load-image",
+    "search",
+    "trace",
+    "trace-native-values",
+}
+REA_NATIVE_SEARCH_KINDS = {"strings", "procedures"}
+REA_NATIVE_SEARCH_MODES = {"literal", "regex"}
+REA_REQUIRED_COMMANDS = frozenset(REA_STATIC_WORKFLOWS.values()) | {
+    "inspect-managed-members",
+    "inspect-evm-interface",
+    "inspect-web-network-capture",
+    "search-android-classes",
+    "inspect-android-class",
+    "inspect-android-method",
+    "inspect-with-objdump",
+} | REA_NATIVE_COMMANDS
 
 mcp = FastMCP(
     "blackwall-lab",
@@ -63,17 +118,29 @@ def _sample(path: str) -> Path:
 
 def _run(cmd: list[str] | str, timeout: int = 300, cwd: Path = WORK, shell: bool = False) -> dict:
     t0 = time.time()
+    # The MCP exposes an intentional analyst shell, but only inside BlackWall's
+    # locked-down, networkless container. All other callers pass argv lists.
+    proc = subprocess.Popen(  # nosec B602
+        cmd, cwd=cwd, shell=shell, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, errors="replace", executable="/bin/bash" if shell else None,
+        start_new_session=True,
+    )
     try:
-        r = subprocess.run(
-            cmd, cwd=cwd, shell=shell, capture_output=True, text=True,
-            errors="replace", timeout=timeout,
-            executable="/bin/bash" if shell else None,
-        )
-        return {"rc": r.returncode, "stdout": r.stdout, "stderr": r.stderr,
-                "seconds": round(time.time() - t0, 1)}
-    except subprocess.TimeoutExpired as e:
-        return {"rc": None, "stdout": (e.stdout or b"").decode(errors="replace") if isinstance(e.stdout, bytes) else (e.stdout or ""),
-                "stderr": f"timed out after {timeout}s", "seconds": timeout}
+        stdout, stderr = proc.communicate(timeout=timeout)
+        return {"rc": proc.returncode, "stdout": stdout, "stderr": stderr,
+                "seconds": round(time.time() - t0, 1), "timed_out": False}
+    except subprocess.TimeoutExpired:
+        # Kill the whole process group. Killing only the immediate process leaves
+        # helper processes from tools such as binwalk running in the case.
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        stdout, stderr = proc.communicate()
+        message = f"timed out after {timeout}s"
+        stderr = f"{stderr.rstrip()}\n{message}" if stderr else message
+        return {"rc": None, "stdout": stdout, "stderr": stderr,
+                "seconds": round(time.time() - t0, 1), "timed_out": True}
 
 
 def _clip(text: str, limit: int = MAX_RESULT) -> str:
@@ -82,11 +149,165 @@ def _clip(text: str, limit: int = MAX_RESULT) -> str:
     return text[:limit] + f"\n... [truncated {len(text) - limit} chars]"
 
 
+def _preview(value: object, limit: int = 512) -> str:
+    """Bound one untrusted metadata value without losing its original length."""
+    text = str(value)
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"... [truncated {len(text) - limit} chars]"
+
+
+def _bounded_values(values, item_limit: int, char_limit: int) -> list[str]:
+    """Return exact string values within both item and aggregate character caps."""
+    result, used = [], 0
+    for value in values:
+        text = str(value)
+        if len(result) >= item_limit or used + len(text) > char_limit:
+            break
+        result.append(text)
+        used += len(text)
+    return result
+
+
+_SECRET_PATTERNS = (
+    (re.compile(r"_\|WARNING:-DO-NOT-SHARE-THIS[^\s]*", re.I), "roblox_session"),
+    (re.compile(r"\beyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{10,}(?:\.[A-Za-z0-9_-]{10,})?\b"), "jwt"),
+    (re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----.*?-----END (?:RSA |EC |OPENSSH )?PRIVATE KEY-----", re.I | re.S), "private_key"),
+    (re.compile(r"(?i)(?:\b(?:password|passwd|pwd|api[_ -]?key|access[_ -]?token|secret)\s*[:=]\s*|[=:]\s*\b(?:password|passwd|pwd|api[_ -]?key|access[_ -]?token|secret)\s+)[^\s,;]+"), "credential"),
+)
+
+
+def _redact_text(value: str) -> tuple[str, int]:
+    """Redact common live-secret formats before returning sample text to a model."""
+    count = 0
+    for pattern, label in _SECRET_PATTERNS:
+        value, n = pattern.subn(f"<redacted:{label}>", value)
+        count += n
+    return value, count
+
+
+def _redact_value(value: object) -> tuple[object, int]:
+    """Recursively redact strings in structured output returned to the model."""
+    if isinstance(value, str):
+        return _redact_text(value)
+    if isinstance(value, list):
+        redacted, count = [], 0
+        for item in value:
+            item, n = _redact_value(item)
+            redacted.append(item)
+            count += n
+        return redacted, count
+    if isinstance(value, dict):
+        redacted, count = {}, 0
+        for key, item in value.items():
+            item, n = _redact_value(item)
+            redacted[key] = item
+            count += n
+        return redacted, count
+    return value, 0
+
+
 def _save(name: str, data) -> Path:
     OUT.mkdir(parents=True, exist_ok=True)
     p = OUT / name
     p.write_text(data if isinstance(data, str) else json.dumps(data, indent=2, default=str))
     return p
+
+
+def _rea_selector(value: str, label: str, max_length: int = 512) -> str:
+    """Validate one positional REA selector without treating it as an option."""
+    if not value or len(value) > max_length or "\0" in value or value.startswith("-"):
+        raise ValueError(f"invalid {label}")
+    return value
+
+
+def _rea_available_commands() -> set[str]:
+    """Read the installed CLI manifest instead of trusting per-command --help.
+
+    REA's CLI can return its top-level help successfully for an unknown command,
+    so command availability must be checked against the explicit Commands block.
+    """
+    run = _run([REA_BIN, "--help"], timeout=30)
+    if run["rc"] != 0:
+        raise RuntimeError(f"REA command manifest failed: {_clip(run['stderr'], 1000)}")
+    try:
+        block = run["stdout"].split("Commands:\n", 1)[1].split("\n\nIntegrations:", 1)[0]
+    except IndexError as exc:
+        raise RuntimeError("REA command manifest has an unexpected format") from exc
+    return {
+        line.strip().split(maxsplit=1)[0]
+        for line in block.splitlines()
+        if line.startswith("  ") and line.strip()
+    }
+
+
+def _validate_rea_command_manifest() -> dict:
+    available = _rea_available_commands()
+    missing = sorted(REA_REQUIRED_COMMANDS - available)
+    if missing:
+        raise RuntimeError(f"REA commands missing from installed release: {', '.join(missing)}")
+    return {"required": len(REA_REQUIRED_COMMANDS), "available": len(available)}
+
+
+def _rea_run(path: Path, workflow: str, arguments: list[str], timeout: int) -> dict:
+    """Run one allowlisted REA command and retain its complete evidence locally."""
+    timeout = max(10, min(int(timeout), 1800))
+    command = [REA_BIN, *arguments, "--format", "json"]
+    run = _run(command, timeout=timeout)
+    stdout = run["stdout"]
+    try:
+        evidence = json.loads(stdout)
+    except json.JSONDecodeError:
+        evidence = None
+
+    # Include the complete argument vector so focused calls against different
+    # functions or search terms retain distinct evidence instead of silently
+    # replacing one another.
+    identity_input = json.dumps(
+        {"workflow": workflow, "path": str(path), "arguments": arguments},
+        ensure_ascii=False, separators=(",", ":"),
+    )
+    identity = hashlib.sha256(identity_input.encode()).hexdigest()[:16]
+    saved = _save(f"rea-{workflow}-{identity}.json", {
+        "schema": "blackwall.rea-run.v1",
+        "workflow": workflow,
+        "target": str(path),
+        "command": arguments[0],
+        "arguments": arguments[1:],
+        "rc": run["rc"],
+        "timed_out": run["timed_out"],
+        "seconds": run["seconds"],
+        "evidence": evidence,
+        "stdout": None if evidence is not None else stdout,
+        "stderr": run["stderr"],
+    })
+
+    result = {
+        "workflow": workflow,
+        "command": arguments[0],
+        "target": str(path),
+        "rc": run["rc"],
+        "timed_out": run["timed_out"],
+        "seconds": run["seconds"],
+        "saved_to": str(saved),
+    }
+    if evidence is not None:
+        redacted, redactions = _redact_value(evidence)
+        encoded = json.dumps(redacted, ensure_ascii=False, default=str)
+        if len(encoded) <= 28_000:
+            result["evidence"] = redacted
+        else:
+            result["evidence_preview"] = _clip(encoded, 28_000)
+            result["evidence_truncated"] = True
+        result["redactions"] = redactions
+    else:
+        redacted, redactions = _redact_text(stdout)
+        result["output_preview"] = _clip(redacted, 28_000)
+        result["redactions"] = redactions
+    if run["stderr"]:
+        # REA writes progress diagnostics to stderr even on successful runs.
+        result["progress"] = _clip(_redact_text(run["stderr"])[0], 4000)
+    return result
 
 
 def _entropy(data: bytes) -> float:
@@ -98,8 +319,10 @@ def _entropy(data: bytes) -> float:
 
 def _hashes(data: bytes) -> dict:
     out = {
-        "md5": hashlib.md5(data).hexdigest(),
-        "sha1": hashlib.sha1(data).hexdigest(),
+        # MD5 and SHA-1 remain useful ecosystem identifiers for malware. They
+        # are never used here for integrity, authentication, or trust.
+        "md5": hashlib.md5(data, usedforsecurity=False).hexdigest(),
+        "sha1": hashlib.sha1(data, usedforsecurity=False).hexdigest(),
         "sha256": hashlib.sha256(data).hexdigest(),
     }
     try:
@@ -266,14 +489,17 @@ def dotnet_info(path: str) -> dict:
 
     p = _sample(path)
     pe = dnfile.dnPE(str(p))
+    if not getattr(pe, "net", None):
+        raise ValueError("not a .NET assembly")
     md = pe.net.mdtables
     types, methods, us = [], [], []
     if md.TypeDef:
         for t in md.TypeDef:
-            types.append(f"{t.TypeNamespace}.{t.TypeName}")
+            value = _redact_text(f"{t.TypeNamespace}.{t.TypeName}")[0]
+            types.append(_preview(value))
     if md.MethodDef:
         for m in md.MethodDef:
-            methods.append(str(m.Name))
+            methods.append(_preview(_redact_text(str(m.Name))[0]))
     if pe.net.user_strings:
         off = 1
         heap = pe.net.user_strings
@@ -284,18 +510,79 @@ def dotnet_info(path: str) -> dict:
                 break
             if s is None:
                 break
-            us.append(s.value if hasattr(s, "value") else str(s))
-            off += s.raw_size if hasattr(s, "raw_size") else 1
+            value = s.value if hasattr(s, "value") else s
+            us.append(_preview(_redact_text(str(value))[0], 1000))
+            off += max(1, s.raw_size if hasattr(s, "raw_size") else 1)
     asm = md.Assembly[0] if md.Assembly else None
     result = {
-        "assembly": str(asm.Name) if asm else None,
+        "assembly": _preview(_redact_text(str(asm.Name))[0]) if asm else None,
         "version": f"{asm.MajorVersion}.{asm.MinorVersion}.{asm.BuildNumber}.{asm.RevisionNumber}" if asm else None,
         "types": types, "methods": methods, "user_strings": us,
-        "manifest_resources": [str(r.Name) for r in (md.ManifestResource or [])],
+        "manifest_resources": [_preview(r.Name) for r in (md.ManifestResource or [])],
     }
     saved = _save(f"dotnet_info-{p.name[:16]}.json", result)
-    return {**{k: (v[:300] if isinstance(v, list) else v) for k, v in result.items()}, "saved_to": str(saved),
-            "hint": "Ghidra handles .NET poorly; read IL via run_python/dnfile or decompile on a dedicated .NET box."}
+    return {
+        "assembly": result["assembly"], "version": result["version"],
+        "type_count": len(types), "types": _bounded_values(types, 100, 7000),
+        "method_count": len(methods), "methods": _bounded_values(methods, 200, 7000),
+        "user_string_count": len(us), "user_strings": _bounded_values(us, 150, 14000),
+        "manifest_resources": _bounded_values(result["manifest_resources"], 100, 4000),
+        "saved_to": str(saved),
+        "hint": "Use dotnet_extract_resources for embedded payloads/data; use run_python+dnfile for IL until ILSpy support lands.",
+    }
+
+
+@mcp.tool()
+def dotnet_extract_resources(path: str, min_size: int = 1) -> dict:
+    """Extract embedded CLR manifest resources without executing the assembly.
+    Each blob is content-addressed under samples/derived. Linked/external
+    resources are reported but not followed."""
+    import dnfile
+
+    p = _sample(path)
+    pe = dnfile.dnPE(str(p))
+    if not getattr(pe, "net", None):
+        raise ValueError("not a .NET assembly")
+    resources = getattr(pe.net.mdtables, "ManifestResource", None) or []
+    base_rva = int(pe.net.struct.ResourcesRva)
+    file_size = p.stat().st_size
+    extracted, skipped = [], []
+    for resource in resources:
+        name = _preview(_redact_text(str(resource.Name))[0])
+        implementation = getattr(resource, "Implementation", None)
+        if implementation is not None and getattr(implementation, "row", None) is not None:
+            skipped.append({"name": name, "reason": "external or linked resource"})
+            continue
+        try:
+            rva = base_rva + int(resource.Offset)
+            size_data = pe.get_data(rva, 4)
+            if len(size_data) != 4:
+                raise ValueError("missing resource length")
+            size = int.from_bytes(size_data, "little")
+            if size > file_size:
+                raise ValueError(f"resource length exceeds file size ({size}/{file_size} bytes)")
+            blob = pe.get_data(rva + 4, size)
+            if len(blob) != size:
+                raise ValueError(f"resource is truncated ({len(blob)}/{size} bytes)")
+        except Exception as exc:
+            skipped.append({"name": name, "reason": str(exc)})
+            continue
+        if size < max(0, min_size):
+            skipped.append({"name": name, "size": size, "reason": "below min_size"})
+            continue
+        with tempfile.NamedTemporaryFile(dir="/tmp", delete=False) as tf:
+            tf.write(blob)
+            tmp = Path(tf.name)
+        try:
+            dst = _register_derived(tmp, f".NET resource {name} from {p.name}")
+        finally:
+            tmp.unlink(missing_ok=True)
+        extracted.append({
+            "name": name, "size": size, "sha256": dst.name, "path": str(dst),
+            "magic": _run(["file", "-b", str(dst)], timeout=10)["stdout"].strip(),
+            "entropy": _entropy(blob), "head": blob[:16].hex(),
+        })
+    return {"extracted": extracted, "skipped": skipped, "count": len(extracted)}
 
 
 @mcp.tool()
@@ -334,6 +621,313 @@ def elf_info(path: str) -> dict:
     }
     result["saved_to"] = str(_save(f"elf_info-{p.name[:16]}.json", result))
     return result
+
+
+# --------------------------------------------------------------------------- REA static analysis
+
+
+def _rea_target(path: str) -> Path:
+    p = _resolve(path)
+    if not (p.is_file() or p.is_dir()):
+        raise FileNotFoundError(f"no such file or directory: {p}")
+    return p
+
+
+def _rea_typed_snapshot(path: Path, suffix: str) -> Path:
+    """Give extension-sensitive REA providers a stable, read-only typed name.
+
+    BlackWall deliberately stores samples under their SHA-256 rather than an
+    attacker-controlled original name. Some providers still use a verified
+    suffix as part of format admission (JADX requires ``.apk``), so copy the
+    bytes to a content-addressed, read-only staging name instead of weakening
+    the canonical sample naming rule.
+    """
+    suffix = suffix.lower()
+    if not re.fullmatch(r"\.[a-z0-9][a-z0-9.-]{0,15}", suffix):
+        raise ValueError("invalid REA staging suffix")
+    if not path.is_file():
+        raise ValueError(f"REA typed input must be a regular file: {path}")
+    if path.name.lower().endswith(suffix):
+        return path
+
+    staging = WORK / "scratch" / "rea-inputs"
+    staging.mkdir(parents=True, exist_ok=True)
+    tmp_path: Path | None = None
+    try:
+        digest = hashlib.sha256()
+        with path.open("rb") as source, tempfile.NamedTemporaryFile(
+            dir=staging, prefix=".snapshot-", delete=False,
+        ) as snapshot:
+            tmp_path = Path(snapshot.name)
+            while chunk := source.read(1024 * 1024):
+                digest.update(chunk)
+                snapshot.write(chunk)
+            snapshot.flush()
+            os.fsync(snapshot.fileno())
+
+        destination = staging / f"{digest.hexdigest()}{suffix}"
+        if destination.exists():
+            existing_digest = hashlib.sha256()
+            with destination.open("rb") as existing_file:
+                while chunk := existing_file.read(1024 * 1024):
+                    existing_digest.update(chunk)
+            existing = existing_digest.hexdigest()
+            if existing != digest.hexdigest():
+                raise RuntimeError(f"REA staged input failed integrity check: {destination}")
+            return destination
+
+        tmp_path.chmod(0o444)
+        os.replace(tmp_path, destination)
+        tmp_path = None
+        return destination
+    finally:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
+
+
+@mcp.tool()
+def rea_static_analysis(path: str, workflow: str, timeout: int = 600) -> dict:
+    """Run one pinned REA static-analysis workflow and save the complete Evidence
+    JSON under /work/out. Supported workflows: artifact, pe_resources, go,
+    rust, wasm, managed, managed_members,
+    managed_native_boundaries, javascript, electron_fuses, android, flutter,
+    dart_aot, pcap, sqlite, interface_builder, keyed_archive, dylib_resolution.
+    EVM, web captures, and objdump have focused tools because they need an
+    explicit encoding, format, or operation. This allowlist excludes REA's
+    process, debugger, Frida, ADB, browser, and other runtime commands; target
+    code is not executed."""
+    command = REA_STATIC_WORKFLOWS.get(workflow)
+    if command is None:
+        supported = ", ".join(sorted(REA_STATIC_WORKFLOWS))
+        raise ValueError(f"unknown REA static workflow {workflow!r}; choose: {supported}")
+    p = _rea_target(path)
+    # REA intentionally classifies ZIP-backed package families by suffix after
+    # checking ZIP magic. Canonical BlackWall originals have no suffix, so give
+    # JADX a content-addressed .apk snapshot while retaining p as the evidence
+    # source and tool-result target.
+    analysis_path = _rea_typed_snapshot(p, ".apk") if workflow == "android" else p
+    return _rea_run(p, workflow, [command, str(analysis_path)], timeout)
+
+
+@mcp.tool()
+def rea_managed_members(path: str, type_name: str | None = None,
+                        timeout: int = 600) -> dict:
+    """Statically inspect .NET PE/CLI members, signatures, CIL anchors, and ldstr
+    literals. Optionally restrict results to one exact type name. The assembly
+    is parsed as data and is never loaded as executable code."""
+    p = _rea_target(path)
+    arguments = ["inspect-managed-members", str(p)]
+    if type_name is not None:
+        arguments.extend(["--type", _rea_selector(type_name, "type_name")])
+    return _rea_run(p, "managed_members", arguments, timeout)
+
+
+@mcp.tool()
+def rea_evm_interface(path: str, encoding: str, timeout: int = 600) -> dict:
+    """Infer an EVM contract interface from offline bytecode without chain or
+    target execution. encoding must be raw bytes or an ASCII hex carrier."""
+    if encoding not in REA_EVM_ENCODINGS:
+        raise ValueError("encoding must be 'raw' or 'hex'")
+    p = _rea_target(path)
+    return _rea_run(p, "evm", ["inspect-evm-interface", str(p), encoding], timeout)
+
+
+@mcp.tool()
+def rea_web_capture(path: str, capture_format: str, timeout: int = 600) -> dict:
+    """Inspect a retained HAR, mitmproxy, Fiddler SAZ, or qlog capture offline.
+    Recorded URLs are parsed as evidence and are never fetched."""
+    if capture_format not in REA_WEB_CAPTURE_FORMATS:
+        supported = ", ".join(sorted(REA_WEB_CAPTURE_FORMATS))
+        raise ValueError(f"capture_format must be one of: {supported}")
+    p = _rea_target(path)
+    arguments = ["inspect-web-network-capture", str(p), capture_format]
+    return _rea_run(p, "web_capture", arguments, timeout)
+
+
+@mcp.tool()
+def rea_objdump(path: str, operation: str, timeout: int = 600) -> dict:
+    """Run one evidence-wrapped GNU objdump operation without executing the
+    target. operation must be file_headers, section_headers, symbols,
+    relocations, dwarf, disassemble, or disassemble_all. External debug links
+    are never followed; large raw output stays in the saved Evidence JSON."""
+    if operation not in REA_OBJDUMP_OPERATIONS:
+        supported = ", ".join(sorted(REA_OBJDUMP_OPERATIONS))
+        raise ValueError(f"operation must be one of: {supported}")
+    p = _rea_target(path)
+    return _rea_run(
+        p, f"objdump_{operation}",
+        ["inspect-with-objdump", str(p), operation], timeout,
+    )
+
+
+@mcp.tool()
+def rea_native_overview(path: str, timeout: int = 900) -> dict:
+    """Build a fresh, execution-free REA/Ghidra overview of one native binary.
+
+    Use this after BlackWall triage when a second evidence-oriented inventory is
+    useful. REA launches the Ghidra JVM, never the selected program, and its
+    temporary project is discarded after the command; persistent annotations
+    remain the responsibility of BlackWall's primary ghidra MCP.
+    """
+    p = _sample(path)
+    return _rea_run(
+        p, "native_overview",
+        ["analyze", str(p), "--provider", "ghidra"], timeout,
+    )
+
+
+@mcp.tool()
+def rea_native_function(path: str, procedure: str, timeout: int = 900) -> dict:
+    """Produce REA's complete static Ghidra dossier for one native function.
+
+    The saved Evidence includes pseudocode, assembly, CFG, callers/callees,
+    typed references, referenced strings/names, API-boundary observations, and
+    bounded value-flow facts when available. Seed this with an address or symbol
+    found by BlackWall's persistent Ghidra/capa workflow; target code is not run.
+    """
+    procedure = _rea_selector(procedure, "procedure", 256)
+    p = _sample(path)
+    return _rea_run(
+        p, "native_function",
+        ["function", str(p), procedure, "--provider", "ghidra"], timeout,
+    )
+
+
+@mcp.tool()
+def rea_native_search(path: str, query: str, kind: str = "strings",
+                      mode: str = "literal", case_sensitive: bool = False,
+                      timeout: int = 900) -> dict:
+    """Search Ghidra-defined strings or procedure names through REA.
+
+    This is a bounded static search over a fresh REA/Ghidra analysis. An empty
+    result only covers Ghidra-defined items; it does not prove bytes or behavior
+    are absent, especially in packed or encrypted samples.
+    """
+    if kind not in REA_NATIVE_SEARCH_KINDS:
+        raise ValueError("kind must be 'strings' or 'procedures'")
+    if mode not in REA_NATIVE_SEARCH_MODES:
+        raise ValueError("mode must be 'literal' or 'regex'")
+    query = _rea_selector(query, "query")
+    p = _sample(path)
+    arguments = [
+        "search", str(p), query, "--kind", kind, "--mode", mode,
+        "--provider", "ghidra",
+    ]
+    if case_sensitive:
+        arguments.append("--case-sensitive")
+    return _rea_run(p, f"native_search_{kind}", arguments, timeout)
+
+
+@mcp.tool()
+def rea_native_trace(path: str, query: str, case_sensitive: bool = False,
+                     timeout: int = 900) -> dict:
+    """Trace one literal feature through REA/Ghidra's static references.
+
+    This is useful for independently corroborating how a visible string or
+    symbol reaches relevant functions. Encrypted/constructed values need to be
+    recovered by BlackWall first and may have no static trace.
+    """
+    query = _rea_selector(query, "query")
+    p = _sample(path)
+    arguments = ["trace", str(p), query, "--provider", "ghidra"]
+    if case_sensitive:
+        arguments.append("--case-sensitive")
+    return _rea_run(p, "native_trace", arguments, timeout)
+
+
+@mcp.tool()
+def rea_native_value_flow(path: str, procedure: str, max_depth: int = 2,
+                          max_functions: int = 12, max_call_sites: int = 128,
+                          max_nodes: int = 2000, max_edges: int = 4000,
+                          timeout: int = 1200) -> dict:
+    """Trace bounded static def-use and call dependencies from one function.
+
+    The explicit budgets keep pathological functions from exhausting the lab.
+    Results are decompiler-derived evidence, not observed runtime data. Use this
+    selectively after BlackWall identifies a high-value crypto, config, C2,
+    persistence, injection, or dispatch function.
+    """
+    limits = {
+        "max_depth": (max_depth, 1, 5),
+        "max_functions": (max_functions, 1, 32),
+        "max_call_sites": (max_call_sites, 1, 512),
+        "max_nodes": (max_nodes, 1, 5000),
+        "max_edges": (max_edges, 1, 10000),
+    }
+    for label, (value, lower, upper) in limits.items():
+        if not lower <= value <= upper:
+            raise ValueError(f"{label} must be between {lower} and {upper}")
+    procedure = _rea_selector(procedure, "procedure", 256)
+    p = _sample(path)
+    arguments = [
+        "trace-native-values", str(p), procedure,
+        "--max-depth", str(max_depth),
+        "--max-functions", str(max_functions),
+        "--max-call-sites", str(max_call_sites),
+        "--max-nodes", str(max_nodes),
+        "--max-edges", str(max_edges),
+        "--limit", "1000",
+        "--provider", "ghidra",
+    ]
+    return _rea_run(p, "native_value_flow", arguments, timeout)
+
+
+@mcp.tool()
+def rea_native_load_image(path: str, timeout: int = 900) -> dict:
+    """Verify a native file's static loaded image, source mappings and entry.
+
+    REA imports the immutable source into Ghidra and compares mapped evidence;
+    it does not execute the binary. This is especially useful before trusting
+    addresses from unusual, malformed, or packed PE files.
+    """
+    p = _sample(path)
+    return _rea_run(
+        p, "native_load_image",
+        ["inspect-native-load-image", str(p), "--provider", "ghidra"], timeout,
+    )
+
+
+@mcp.tool()
+def rea_android_search(path: str, query: str, timeout: int = 600) -> dict:
+    """Search class names in an APK with REA's pinned headless JADX adapter.
+    This is static package analysis; it does not install or launch the APK."""
+    p = _sample(path)
+    analysis_path = _rea_typed_snapshot(p, ".apk")
+    query = _rea_selector(query, "query")
+    return _rea_run(
+        p, "android_search",
+        ["search-android-classes", str(analysis_path), query], timeout,
+    )
+
+
+@mcp.tool()
+def rea_android_class(path: str, class_name: str, timeout: int = 600) -> dict:
+    """Statically inspect one class in an APK using REA's pinned headless JADX
+    adapter. Use rea_android_search first when the exact class is unknown."""
+    p = _sample(path)
+    analysis_path = _rea_typed_snapshot(p, ".apk")
+    class_name = _rea_selector(class_name, "class_name")
+    return _rea_run(
+        p, "android_class",
+        ["inspect-android-class", str(analysis_path), class_name], timeout,
+    )
+
+
+@mcp.tool()
+def rea_android_method(path: str, class_name: str, method_name: str,
+                       overload_index: int | None = None, timeout: int = 600) -> dict:
+    """Statically inspect one Android method. overload_index selects a specific
+    overload when REA reports more than one; the APK is never installed or run."""
+    p = _sample(path)
+    analysis_path = _rea_typed_snapshot(p, ".apk")
+    class_name = _rea_selector(class_name, "class_name")
+    method_name = _rea_selector(method_name, "method_name")
+    arguments = ["inspect-android-method", str(analysis_path), class_name, method_name]
+    if overload_index is not None:
+        if not 0 <= overload_index <= 10_000:
+            raise ValueError("overload_index must be between 0 and 10000")
+        arguments.extend(["--overload-index", str(overload_index)])
+    return _rea_run(p, "android_method", arguments, timeout)
 
 
 # --------------------------------------------------------------------------- capability / strings / signatures
@@ -386,7 +980,12 @@ def floss(path: str, min_length: int = 6, timeout: int = 900) -> dict:
     s = doc.get("strings", {})
 
     def vals(k, n):
-        return [x.get("string") for x in s.get(k, [])][:n]
+        values = []
+        for item in s.get(k, [])[:n]:
+            value = item.get("string")
+            if isinstance(value, str):
+                values.append(_preview(_redact_text(value)[0], 1000))
+        return _bounded_values(values, n, 8000)
 
     return {
         "decoded_strings": vals("decoded_strings", 500),
@@ -400,7 +999,7 @@ def floss(path: str, min_length: int = 6, timeout: int = 900) -> dict:
 
 @mcp.tool()
 def strings(path: str, min_length: int = 5, pattern: str | None = None, encoding: str = "both",
-            limit: int = 1500) -> dict:
+            limit: int = 1500, redact_secrets: bool = True) -> dict:
     """Fast ASCII/UTF-16LE strings with file offsets. `pattern` is a Python regex
     filter (case-insensitive). encoding: ascii | utf16 | both."""
     p = _sample(path)
@@ -416,14 +1015,21 @@ def strings(path: str, min_length: int = 5, pattern: str | None = None, encoding
     found.sort()
     if rx:
         found = [f for f in found if rx.search(f[2])]
-    lines = [f"{off:#010x} {enc} {s}" for off, enc, s in found]
-    return {"total": len(lines), "strings": _clip("\n".join(lines[:limit]))}
+    redactions = 0
+    lines = []
+    for off, enc, value in found:
+        if redact_secrets:
+            value, count = _redact_text(value)
+            redactions += count
+        lines.append(f"{off:#010x} {enc} {value}")
+    return {"total": len(lines), "redactions": redactions,
+            "strings": _clip("\n".join(lines[:limit]))}
 
 
 IOC_PATTERNS = {
-    "url": r"\b(?:https?|ftp|wss?)://[\w.\-:@%/?#=&~+]{4,}",
+    "url": r"\b(?:https?|ftp|wss?)://[^\s\"'<>]{4,2048}",
     "ipv4": r"\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)(?::\d{2,5})?\b",
-    "domain": r"\b(?:[a-z0-9](?:[a-z0-9\-]{0,61}[a-z0-9])?\.)+(?:com|net|org|info|biz|ru|cn|su|top|xyz|io|cc|tk|pw|online|site|club|onion|me|co|us|uk|de|in|br|kr|jp|ir)\b",
+    "domain": r"\b(?:[a-z0-9](?:[a-z0-9\-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}\b",
     "email": r"\b[\w.+\-]+@[\w\-]+\.[\w.\-]+\b",
     "registry": r"\b(?:HKLM|HKCU|HKCR|HKU|HKEY_[A-Z_]+|SOFTWARE\\|Software\\Microsoft\\Windows\\CurrentVersion\\Run)[\\\w .\-{}]*",
     "windows_path": r"\b[A-Za-z]:\\[\w\\ .\-$%()]{3,}",
@@ -431,9 +1037,159 @@ IOC_PATTERNS = {
     "unix_path": r"(?<![\w/])/(?:etc|tmp|var|dev|proc|usr|bin|sbin|root|home|lib|opt|run)/[\w./\-]+",
     "named_pipe": r"\\\\\.\\pipe\\[\w\-.]+",
     "mutex_like": r"\b(?:Global|Local)\\[\w\-.{}]{4,}",
-    "btc_wallet": r"\b(?:bc1|[13])[a-zA-HJ-NP-Z0-9]{25,39}\b",
-    "user_agent": r"Mozilla/\d\.\d \([^)]{5,}\)[^\"']{0,120}",
+    "btc_wallet": r"\b(?:[13][a-km-zA-HJ-NP-Z1-9]{25,34}|bc1[a-zA-HJ-NP-Z0-9]{11,87})\b",
+    "user_agent": r"Mozilla/\d\.\d \([^)]{5,}\)[^\"'\r\n]{0,120}",
 }
+
+_DOMAIN_TLDS = {
+    "app", "biz", "br", "cc", "club", "cn", "co", "com", "de", "dev", "host",
+    "in", "info", "io", "ir", "jp", "kr", "me", "net", "onion", "online", "org",
+    "pw", "ru", "site", "su", "tk", "top", "uk", "us", "xyz",
+}
+_CODE_NAMESPACE_DOMAINS = {
+    "bouncycastle.crypto.io", "myapplication.app", "org.bouncycastle.crypto.io",
+    "system.io", "system.net",
+}
+_CODE_NAMESPACE_PREFIXES = ("bouncycastle.", "org.bouncycastle.")
+_BENIGN_DOMAINS = {
+    "digicert.com", "globalsign.com", "gnu.org", "microsoft.com", "openssl.org",
+    "sectigo.com", "stackoverflow.com", "symantec.com", "verisign.com", "w3.org",
+    "xmlsoap.org",
+}
+_BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+_BECH32_ALPHABET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
+
+
+def _valid_btc_wallet(value: str) -> bool:
+    if value.lower().startswith("bc1"):
+        if value.lower() != value and value.upper() != value:
+            return False
+        value = value.lower()
+        if not 14 <= len(value) <= 90 or any(c not in _BECH32_ALPHABET for c in value[3:]):
+            return False
+        data = [_BECH32_ALPHABET.index(c) for c in value[3:]]
+        expanded = [ord(c) >> 5 for c in "bc"] + [0] + [ord(c) & 31 for c in "bc"]
+        chk = 1
+        for item in expanded + data:
+            top = chk >> 25
+            chk = (chk & 0x1FFFFFF) << 5 ^ item
+            for i, generator in enumerate((0x3B6A57B2, 0x26508E6D, 0x1EA119FA, 0x3D4233DD, 0x2A1462B3)):
+                if (top >> i) & 1:
+                    chk ^= generator
+        return chk in (1, 0x2BC830A3)
+    if not 26 <= len(value) <= 35 or any(c not in _BASE58_ALPHABET for c in value):
+        return False
+    number = 0
+    for char in value:
+        number = number * 58 + _BASE58_ALPHABET.index(char)
+    decoded = number.to_bytes((number.bit_length() + 7) // 8, "big")
+    decoded = b"\0" * (len(value) - len(value.lstrip("1"))) + decoded
+    return len(decoded) == 25 and hashlib.sha256(hashlib.sha256(decoded[:-4]).digest()).digest()[:4] == decoded[-4:]
+
+
+def _valid_hostname(value: str) -> bool:
+    labels = value.rstrip(".").lower().split(".")
+    if len(labels) < 2:
+        return False
+    return all(0 < len(label) <= 63 and re.fullmatch(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?", label)
+               for label in labels)
+
+
+def _valid_domain_candidate(value: str) -> bool:
+    value = value.rstrip(".").lower()
+    labels = value.split(".")
+    return (_valid_hostname(value) and labels[-1] in _DOMAIN_TLDS
+            and value not in _CODE_NAMESPACE_DOMAINS
+            and not value.startswith(_CODE_NAMESPACE_PREFIXES))
+
+
+def _is_benign_domain(value: str) -> bool:
+    value = value.lower().rstrip(".")
+    return any(value == domain or value.endswith(f".{domain}") for domain in _BENIGN_DOMAINS)
+
+
+def _looks_like_version_or_oid(value: str) -> bool:
+    parts = [int(x) for x in value.split(".")]
+    # Keep legitimate 1.x/2.x addresses (notably 1.1.1.1); bare values are
+    # already returned as low-confidence candidates. A trailing zero is a
+    # much stronger version-number signal in binary metadata.
+    return parts[0] <= 20 and parts[-1] == 0
+
+
+def _extract_iocs_from_text(text: str) -> dict:
+    """Extract and validate candidates while separating low-confidence bare IPs."""
+    out: dict[str, list[str] | str] = {}
+
+    urls = {m.group().rstrip(".,);]") for m in re.finditer(IOC_PATTERNS["url"], text, re.I)}
+    strong_ips, bare_ips, url_domains = set(), set(), set()
+    filtered_urls = []
+    for url in urls:
+        try:
+            host = urlsplit(url).hostname
+            if not host:
+                filtered_urls.append(url)
+                continue
+            if not _is_benign_domain(host):
+                filtered_urls.append(url)
+            try:
+                strong_ips.add(str(ipaddress.ip_address(host)))
+            except ValueError:
+                # A parsed URL is stronger evidence than a bare dotted string,
+                # so do not require its TLD to be in the noise-reduction list.
+                if _valid_hostname(host) and not _is_benign_domain(host):
+                    url_domains.add(host.lower())
+        except ValueError:
+            filtered_urls.append(url)
+            continue
+    if filtered_urls:
+        out["url"] = _bounded_values(sorted(filtered_urls), 300, 12000)
+    for match in re.finditer(IOC_PATTERNS["ipv4"], text, re.I):
+        value = match.group()
+        host, sep, port = value.rpartition(":")
+        host = host if sep else value
+        if (match.start() and text[match.start() - 1] == ".") or (match.end() < len(text) and text[match.end()] == "."):
+            continue
+        try:
+            address = ipaddress.ip_address(host)
+        except ValueError:
+            continue
+        if address.is_unspecified or address.is_multicast or _looks_like_version_or_oid(host):
+            continue
+        if sep and 1 <= int(port) <= 65535:
+            strong_ips.add(value)
+        elif str(address) not in strong_ips:
+            bare_ips.add(str(address))
+    if strong_ips:
+        out["ipv4"] = sorted(strong_ips)[:300]
+    if bare_ips:
+        out["ipv4_candidates"] = sorted(bare_ips)[:100]
+
+    domains = set(url_domains)
+    for match in re.finditer(IOC_PATTERNS["domain"], text, re.I):
+        value = match.group().lower()
+        if _valid_domain_candidate(value) and not _is_benign_domain(value):
+            domains.add(value)
+    if domains:
+        out["domain"] = sorted(domains)[:300]
+
+    for kind in ("email", "registry", "windows_path", "env_path", "unix_path", "named_pipe", "mutex_like"):
+        hits = {m.group().strip() for m in re.finditer(IOC_PATTERNS[kind], text, re.I)}
+        if kind == "email":
+            hits = {hit for hit in hits if not _is_benign_domain(hit.rpartition("@")[2])}
+        if hits:
+            out[kind] = sorted(hits)[:300]
+
+    wallets = {m.group() for m in re.finditer(IOC_PATTERNS["btc_wallet"], text, re.I)}
+    wallets = {wallet for wallet in wallets if _valid_btc_wallet(wallet)}
+    if wallets:
+        out["btc_wallet"] = sorted(wallets)[:100]
+
+    agents = {m.group().strip() for m in re.finditer(IOC_PATTERNS["user_agent"], text, re.I)}
+    if agents:
+        out["user_agent"] = sorted(_redact_text(agent)[0] for agent in agents)[:100]
+    if bare_ips:
+        out["candidate_notice"] = "Bare IPs are low-confidence string candidates; verify them in code or emulation."
+    return out
 
 
 @mcp.tool()
@@ -452,13 +1208,7 @@ def extract_iocs(path: str, include_floss: bool = True) -> dict:
         s = json.loads(floss_file.read_text()).get("strings", {})
         for k in ("decoded_strings", "stack_strings", "tight_strings"):
             text += "\n" + "\n".join(x.get("string", "") for x in s.get(k, []))
-    benign = re.compile(r"(microsoft\.com|w3\.org|xmlsoap\.org|digicert|verisign|symantec|globalsign|sectigo|openssl\.org|gnu\.org)", re.I)
-    out = {}
-    for kind, pat in IOC_PATTERNS.items():
-        hits = sorted({m.group().strip() for m in re.finditer(pat, text, re.I)})
-        hits = [h for h in hits if not benign.search(h)]
-        if hits:
-            out[kind] = hits[:300]
+    out = _extract_iocs_from_text(text)
     out["used_floss_output"] = include_floss and floss_file.exists()
     return out
 
@@ -534,10 +1284,25 @@ def upx_unpack(path: str) -> dict:
 
 
 @mcp.tool()
-def carve_embedded(path: str, min_size: int = 1024) -> dict:
+def binwalk_scan(path: str, timeout: int = 30) -> dict:
+    """Run binwalk signature scanning separately from carving. It is opt-in
+    because some inputs make binwalk expensive even when carving is immediate."""
+    p = _sample(path)
+    timeout = max(1, min(timeout, 120))
+    result = _run(["binwalk", "--term", str(p)], timeout=timeout)
+    return {
+        "rc": result["rc"], "timed_out": result["timed_out"],
+        "seconds": result["seconds"], "stdout": _clip(result["stdout"], 8000),
+        "stderr": _clip(result["stderr"], 2000),
+    }
+
+
+@mcp.tool()
+def carve_embedded(path: str, min_size: int = 1024, run_binwalk: bool = False,
+                   binwalk_timeout: int = 30) -> dict:
     """Find and extract embedded executables (MZ/PE, ELF) at non-zero offsets,
-    e.g. payloads in overlays or resources. Also reports binwalk signatures.
-    Carved files are registered under samples/derived."""
+    e.g. payloads in overlays or resources. Carved files are registered under
+    samples/derived. Binwalk is optional so it cannot delay successful carves."""
     import pefile
 
     p = _sample(path)
@@ -563,16 +1328,21 @@ def carve_embedded(path: str, min_size: int = 1024) -> dict:
             continue
         with tempfile.NamedTemporaryFile(dir="/tmp", delete=False) as tf:
             tf.write(data[off:off + size])
-        dst = _register_derived(Path(tf.name), f"PE carved from {p.name} @ {off:#x}")
-        os.unlink(tf.name)
+            tmp = Path(tf.name)
+        try:
+            dst = _register_derived(tmp, f"PE carved from {p.name} @ {off:#x}")
+        finally:
+            tmp.unlink(missing_ok=True)
         carved.append({"type": "PE", "offset": hex(off), "size": size, "path": str(dst)})
     for m in re.finditer(rb"\x7fELF[\x01\x02][\x01\x02]\x01", data):
         if m.start() == 0:
             continue
         carved.append({"type": "ELF header", "offset": hex(m.start()),
                        "note": "size not computed; slice with run_python if relevant"})
-    bw = _run(["binwalk", "--term", str(p)], timeout=300)
-    return {"carved": carved, "binwalk": _clip(bw["stdout"], 8000)}
+    result = {"carved": carved, "count": len(carved)}
+    result["binwalk"] = (binwalk_scan(str(p), binwalk_timeout) if run_binwalk else
+                         {"status": "skipped", "hint": "call binwalk_scan or set run_binwalk=true"})
+    return result
 
 
 @mcp.tool()
@@ -603,6 +1373,21 @@ def emulate_windows(path: str, timeout: int = 60, shellcode_arch: str | None = N
     network and process activity, and dumps any memory-written PEs to
     samples/derived. Great for unpacking, API-hash resolution and C2 discovery."""
     p = _sample(path)
+    if not shellcode_arch:
+        try:
+            import pefile
+            pe = pefile.PE(str(p), fast_load=True)
+            clr = pe.OPTIONAL_HEADER.DATA_DIRECTORY[
+                pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR"]
+            ]
+            if clr.VirtualAddress:
+                return {
+                    "unsupported_format": "dotnet",
+                    "error": "Speakeasy does not support .NET assemblies",
+                    "hint": "Use dotnet_info, dotnet_extract_resources, capa, and run_python+dnfile instead.",
+                }
+        except Exception:
+            pass
     script = Path("/opt/blackwall/lab/blackwall_lab/emu_speakeasy.py")
     with tempfile.TemporaryDirectory(dir="/tmp") as td:
         args = [sys.executable, "-I", str(script), str(p), td, str(timeout), str(max_api_calls),

@@ -15,10 +15,13 @@ triage steps 1–5 on it, and record the layer chain in `notes/findings.md`
    magic, section names, and l_info against a clean UPX layout, repair them in
    `lab.run_python`, then retry.
 2. **Embedded payloads.** `lab.carve_embedded` finds PEs/ELFs in overlays and
-   resources. For high-entropy resources or overlays, dump them
-   (`lab.extract_pe_resource` or slice in `run_python`) and look for the
-   decryption routine in Ghidra: xrefs to `FindResource`/`LoadResource`/
-   `SizeofResource`, or to the overlay offset. Then reimplement it.
+   resources without waiting for binwalk; run `lab.binwalk_scan` separately
+   when signature scanning will help. For managed assemblies, try
+   `lab.dotnet_extract_resources` first. For high-entropy native PE resources
+   or overlays, dump them (`lab.extract_pe_resource` or slice in `run_python`)
+   and look for the decryption routine in Ghidra: xrefs to
+   `FindResource`/`LoadResource`/`SizeofResource`, or to the overlay offset.
+   Then reimplement it.
 3. **Emulation.** `lab.emulate_windows` lets the stub decrypt itself in
    Speakeasy. Look at `dumped_to_derived`, VirtualAlloc/VirtualProtect/
    WriteProcessMemory calls, and dynamic API resolution. For shellcode, pass
@@ -31,8 +34,10 @@ triage steps 1–5 on it, and record the layer chain in `notes/findings.md`
    brute force first on short blobs with known plaintext (`MZ`,
    `This program`).
 5. **.NET crypters.** Use `dotnet_info` for resource names and user strings,
-   and parse/decrypt resources with `run_python` + dnfile. Note that Ghidra is
-   weak on IL; say so in your notes when it limits your confidence.
+   REA's `managed`, `managed_members`, and `managed_native_boundaries` static
+   workflows for CIL anchors and P/Invoke declarations, and parse/decrypt
+   resources with `run_python` + dnfile. Note that Ghidra is weak on IL; say so
+   in your notes when it limits your confidence.
 6. **Still packed?** Write down exactly what blocks you (anti-emulation,
    VM-based protector, needs real Windows APIs), what you tried, and suggest
    phase-2 dynamic analysis (a detonation VM). Don't fake progress.

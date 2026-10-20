@@ -78,6 +78,10 @@ write_case_json() {  # sha source original_name
 
 container_running() { [ "$(docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null)" = "true" ]; }
 container_gui()     { docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$1" 2>/dev/null | grep -q '^BW_GUI=1$'; }
+container_uses_current_image() {
+  [ "$(docker inspect -f '{{.Image}}' "$1" 2>/dev/null)" = \
+    "$(docker image inspect -f '{{.Id}}' "$IMAGE" 2>/dev/null)" ]
+}
 
 start_sandbox() {  # sha gui(0|1)
   local sha=$1 gui=$2 c v dir
@@ -85,7 +89,10 @@ start_sandbox() {  # sha gui(0|1)
   need_image
 
   if docker inspect "$c" >/dev/null 2>&1; then
-    if [ "$gui" = 1 ] && ! container_gui "$c"; then
+    if ! container_uses_current_image "$c"; then
+      info "recreating sandbox with updated image (analysis state is kept in volume $v)"
+      docker rm -f "$c" >/dev/null
+    elif [ "$gui" = 1 ] && ! container_gui "$c"; then
       info "recreating sandbox with GUI support (analysis state is kept in volume $v)"
       docker rm -f "$c" >/dev/null
     elif ! container_running "$c"; then
@@ -164,9 +171,18 @@ cmd_doctor() {
     check "pyghidra-mcp"              "docker run --rm $IMAGE pyghidra-mcp --version" "rebuild"
     check "radare2 + r2mcp"           "docker run --rm $IMAGE sh -c 'r2 -v && command -v r2mcp'" "rebuild"
     check "capa / floss / diec / upx" "docker run --rm $IMAGE sh -c 'capa --version && floss --version && command -v diec upx'" "rebuild"
+    check "REA static lane"          "docker run --rm --network none $IMAGE sh -c '/opt/rea/runtime/node_modules/.bin/rea inspect-go-binary /bin/true --format json | jq -e . >/dev/null'" "rebuild"
+    check "REA safety profile"       "docker run --rm $IMAGE sh -c 'test \"\$(/opt/rea/runtime/node_modules/.bin/rea --version)\" = 6.7.0 && test -r \"\$REA_JADX_MCP_JAR\" && test ! -d /opt/rea/runtime/node_modules/frida && ! command -v rea && command -v ps'" "rebuild"
+    check "REA command manifest"      "docker run --rm $IMAGE python -c 'from blackwall_lab.server import _validate_rea_command_manifest as validate; validate()'" "rebuild"
+    check "REA static providers"      "docker run --rm $IMAGE sh -c 'test \"\$(\$REA_WABT_BIN_DIRECTORY/wasm-validate --version)\" = 1.0.42 && tshark --version | head -1 | grep -q \"^TShark (Wireshark) 4\\.\" && capinfos --version | head -1 | grep -q \"^Capinfos (Wireshark) 4\\.\" && /opt/rea/runtime/node_modules/.bin/rea inspect-with-objdump /bin/true file_headers --format json | jq -e . >/dev/null'" "rebuild"
     check "lab MCP server imports"    "docker run --rm -e HOME=/tmp $IMAGE python -c 'import blackwall_lab.server, blackwall_lab.intel'" "rebuild"
+    check "lab regression tests"      "docker run --rm -e HOME=/tmp $IMAGE python -m unittest discover -s /opt/blackwall/lab/tests" "rebuild"
   fi
-  [ "$ok" = 1 ] && info "all good" || warn "some checks failed"
+  if [ "$ok" = 1 ]; then
+    info "all good"
+  else
+    warn "some checks failed"
+  fi
 }
 
 cmd_setup() {

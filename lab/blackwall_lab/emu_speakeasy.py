@@ -97,6 +97,7 @@ def main():
     se = speakeasy.Speakeasy(config=cfg)
     module = None
     before, mod_prefix = {}, None
+    failure = None
     try:
         if sc_arch:
             addr = se.load_shellcode(sample, ARCH[sc_arch.lower()])
@@ -110,19 +111,39 @@ def main():
                 rva = next((e.address - module.get_base() for e in module.get_exports()
                             if e.name == export), None)
                 if rva is None:
-                    raise SystemExit(f"export not found: {export}")
+                    raise ValueError(f"export not found: {export}")
                 se.run_module(module, entry_point=rva)
             else:
                 se.run_module(module, all_entrypoints=True)
     except Exception as e:  # keep whatever the emulator collected
-        print(f"emulation stopped: {type(e).__name__}: {e}", file=sys.stderr)
+        failure = f"{type(e).__name__}: {e}"
+        print(f"emulation stopped: {failure}", file=sys.stderr)
 
-    rep = json.loads(se.get_json_report())
+    try:
+        rep = json.loads(se.get_json_report())
+    except Exception as report_error:
+        # Load failures can leave Speakeasy uninitialized, in which case there
+        # is no report or memory state to retrieve.
+        result = {
+            "summary": {
+                "errors": [failure or f"{type(report_error).__name__}: {report_error}"],
+                "entry_points": [], "api_counts": {},
+            },
+            "raw": {},
+        }
+        (outdir / "report.json").write_text(json.dumps(result))
+        return
+    if failure:
+        errors = rep.get("errors")
+        if not isinstance(errors, list):
+            errors = [] if errors is None else [str(errors)]
+        errors.append(failure)
+        rep["errors"] = errors
 
     # Dump memory regions that now hold a PE image (unpacked/injected payloads),
     # skipping the loaded modules and emulator internals.
     seen = set()
-    for tag, base, size, is_free, proc, data in se.get_memory_dumps():
+    for tag, base, _size, _is_free, _proc, data in se.get_memory_dumps():
         tag = str(tag or "")
         if not data or tag.startswith(SKIP_TAGS):
             continue
@@ -141,7 +162,7 @@ def main():
     # if they changed, dump the module as a memory-layout image.
     if before:
         after = _module_regions(se, mod_prefix)
-        if any(after.get(b) != d for b, d in before.items()):
+        if after and any(after.get(b) != d for b, d in before.items()):
             lo = min(after)
             hi = max(b + len(d) for b, d in after.items())
             img = bytearray(hi - lo)

@@ -1,5 +1,6 @@
 *
 !docker/
 !lab/
+!rea-runtime/
 !rules/
 lab/**/__pycache__
