@@ -8,3 +8,7 @@ benchmarks/fixtures-src/dotnet/obj/
 *.exe
 *.dll
 *.bin
+
+# Deterministic inert corpus artifacts are hash-verified and safe to commit.
+!benchmarks/fixtures/nested-firmware.zip
+!benchmarks/fixtures/family-config.bin

@@ -692,11 +692,26 @@ def build() -> None:
 def verify() -> None:
     manifest = json.loads(MANIFEST.read_text())
     failed = []
+    expected_paths = []
     for fixture in manifest["fixtures"]:
         path = (MANIFEST.parent / fixture["path"]).resolve()
+        expected_paths.append(path.relative_to(ROOT.parent).as_posix())
         digest = hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else "missing"
         if digest != fixture["sha256"]:
             failed.append(f"{fixture['id']}: expected {fixture['sha256']}, got {digest}")
+
+    # A developer's ignored file can satisfy the hash check locally while being
+    # absent from a clean checkout.  Verify Git coverage when a worktree exists;
+    # release images intentionally omit .git and still verify the file hashes.
+    if (ROOT.parent / ".git").exists():
+        tracked = set(
+            run(
+                ["git", "-C", str(ROOT.parent), "ls-files", "--", "benchmarks/fixtures"],
+            ).splitlines()
+        )
+        for path in expected_paths:
+            if path not in tracked:
+                failed.append(f"untracked corpus fixture: {path}")
     if failed:
         raise SystemExit("fixture verification failed:\n" + "\n".join(failed))
     print(f"verified {len(manifest['fixtures'])} inert fixtures")

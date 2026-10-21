@@ -53,7 +53,9 @@ evict_stale() {
     pgrep -f "$PYG" >/dev/null || break
     sleep 1
   done
-  pgrep -f "$PYG" >/dev/null && pkill -KILL -f "$PYG" 2>/dev/null || true
+  if pgrep -f "$PYG" >/dev/null; then
+    pkill -KILL -f "$PYG" 2>/dev/null || true
+  fi
   rm -f "$pid_file" "$mode_file"
 }
 

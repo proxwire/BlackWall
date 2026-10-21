@@ -650,8 +650,9 @@ cmd_import() {
 cmd_clean() {
   local sha c
   sha=$(resolve "${1:-}"); shift || true
-  [ "${1:-}" = "--scratch" ] && [ $# -eq 1 ] \
-    || die "safe cleanup requires exactly: blackwall clean <id> --scratch"
+  if [ "${1:-}" != "--scratch" ] || [ $# -ne 1 ]; then
+    die "safe cleanup requires exactly: blackwall clean <id> --scratch"
+  fi
   c=$(cname "$sha")
   ! container_running "$c" \
     || die "stop or cancel the active analysis before cleaning scratch data"
