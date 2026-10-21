@@ -25,7 +25,7 @@ jobs:
       - name: Install check tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends python3-venv shellcheck
+          sudo apt-get install -y --no-install-recommends jq python3-venv shellcheck
           python3 -m venv "${RUNNER_TEMP}/blackwall-checks"
           "${RUNNER_TEMP}/blackwall-checks/bin/pip" install --disable-pip-version-check \
             bandit==1.9.4 pip-audit==2.10.1 ruff==0.17.1 uv==0.12.21
@@ -34,13 +34,23 @@ jobs:
       - name: Check source
         run: |
           bash -n blackwall docker/bin/bw-ghidra-mcp docker/bin/bw-init \
-            docker/bin/bw-intel-mcp docker/bin/bw-lab-mcp docker/bin/bw-r2mcp
+            docker/bin/bw-intel-mcp docker/bin/bw-lab-mcp docker/bin/bw-r2mcp \
+            docker/bin/bw-benchmark docker/bin/bw-ghidra-ready \
+            docker/bin/bw-reliability tests/test_image_reliability.sh \
+            tests/test_reliability.sh
           shellcheck -e SC1091 blackwall docker/bin/bw-ghidra-mcp \
             docker/bin/bw-init docker/bin/bw-intel-mcp docker/bin/bw-lab-mcp \
-            docker/bin/bw-r2mcp
-          python3 -m compileall -q lab
-          ruff check --select F,I,B lab
-          bandit -q -r -lll lab/blackwall_lab
+            docker/bin/bw-r2mcp docker/bin/bw-benchmark docker/bin/bw-ghidra-ready \
+            docker/bin/bw-reliability tests/test_profiles.sh \
+            tests/test_reliability.sh tests/test_image_reliability.sh
+          bash tests/test_profiles.sh
+          bash tests/test_reliability.sh
+          python3 scripts/check_dependency_exceptions.py --self-check
+          python3 -m compileall -q lab benchmarks scripts
+          python3 benchmarks/build_corpus.py --verify
+          PYTHONPATH=lab python3 -m blackwall_lab.benchmark --self-check
+          ruff check --select F,I,B lab benchmarks scripts
+          bandit -q -r -lll lab/blackwall_lab scripts
           git diff --check "$(git hash-object -t tree /dev/null)" HEAD
 
       - name: Verify Python lock
@@ -59,6 +69,7 @@ jobs:
             --ignore-vuln PYSEC-2026-3813 \
             --ignore-vuln PYSEC-2026-3814 \
             --ignore-vuln PYSEC-2026-3815
+          python3 scripts/check_dependency_exceptions.py --online
 
   image:
     runs-on: ubuntu-24.04
@@ -79,8 +90,25 @@ jobs:
             python -m unittest discover -v -s /opt/blackwall/lab/tests
           docker run --rm --network none blackwall:ci \
             python -c 'from blackwall_lab.server import _validate_rea_command_manifest as validate; validate()'
+          docker run --rm --network none blackwall:ci \
+            bw-lab-mcp --profile strict --check-profile
+          docker run --rm --network none blackwall:ci \
+            bw-lab-mcp --profile expert --check-profile
+          docker run --rm --network none blackwall:ci \
+            bw-lab-mcp --check-router
+          docker run --rm --network none blackwall:ci \
+            bw-lab-mcp --check-evidence
+          docker run --rm --network none blackwall:ci \
+            bw-ghidra-ready --self-check
+          docker run --rm --network none blackwall:ci \
+            bw-reliability --self-check
+          docker run --rm --network none blackwall:ci \
+            bw-benchmark --self-check
+          docker run --rm --network none blackwall:ci \
+            bw-benchmark --mode plan --output /tmp/inert-plan
           docker run --rm --network none blackwall:ci python -m pip check
           docker run --rm blackwall:ci \
             npm audit --prefix /opt/rea/runtime --omit=dev
           docker run --rm --network none blackwall:ci sh -c \
             '/opt/rea/runtime/node_modules/.bin/rea inspect-go-binary /bin/true --format json | jq -e . >/dev/null'
+          bash tests/test_image_reliability.sh blackwall:ci

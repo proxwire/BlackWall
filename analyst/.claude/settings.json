@@ -15,6 +15,14 @@
       "Bash",
       "WebFetch",
       "WebSearch",
+      "Edit(./.claude/**)",
+      "Write(./.claude/**)",
+      "Edit(./.mcp.json)",
+      "Write(./.mcp.json)",
+      "Edit(./CLAUDE.md)",
+      "Write(./CLAUDE.md)",
+      "Edit(./case.json)",
+      "Write(./case.json)",
       "Read(./sample.zip)",
       "Read(./exports/**)"
     ]

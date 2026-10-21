@@ -1,0 +1,40 @@
+{
+  "schema": "blackwall.dependency-exceptions.v1",
+  "reviewed_at": "2026-10-20",
+  "maximum_review_age_days": 30,
+  "pyghidra_chromadb_requirement": "chromadb>=1.3.5",
+  "packages": {
+    "pyghidra-mcp": {
+      "pinned": "0.2.7",
+      "latest_reviewed": "0.2.7",
+      "index": "https://pypi.org/pypi/pyghidra-mcp/json"
+    },
+    "chromadb": {
+      "pinned": "1.5.9",
+      "latest_reviewed": "1.5.9",
+      "index": "https://pypi.org/pypi/chromadb/json"
+    }
+  },
+  "audit_exceptions": [
+    {
+      "id": "PYSEC-2026-311",
+      "package": "chromadb",
+      "advisory": "https://api.osv.dev/v1/vulns/PYSEC-2026-311"
+    },
+    {
+      "id": "PYSEC-2026-3813",
+      "package": "chromadb",
+      "advisory": "https://api.osv.dev/v1/vulns/PYSEC-2026-3813"
+    },
+    {
+      "id": "PYSEC-2026-3814",
+      "package": "chromadb",
+      "advisory": "https://api.osv.dev/v1/vulns/PYSEC-2026-3814"
+    },
+    {
+      "id": "PYSEC-2026-3815",
+      "package": "chromadb",
+      "advisory": "https://api.osv.dev/v1/vulns/PYSEC-2026-3815"
+    }
+  ]
+}

@@ -2,6 +2,7 @@
 cases/
 __pycache__/
 *.pyc
+benchmarks/fixtures-src/dotnet/obj/
 # never commit samples
 *.zip
 *.exe

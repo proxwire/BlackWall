@@ -20,4 +20,6 @@ REA is MIT-licensed; its published package includes its `LICENSE` and
 third-party notices. When updating REA, review the source/tag and published
 tarball, refresh the lockfile with the pinned Node/npm version, update all
 checksums, audit newly added dependencies and lifecycle scripts, and rerun the
-Docker smoke tests before changing the allowlist.
+Docker smoke tests before changing the allowlist. Also rerun the inert benchmark
+and reliability admission suite because a parser or provider update can change
+routing outcomes, timeouts, and descendant-process behavior.

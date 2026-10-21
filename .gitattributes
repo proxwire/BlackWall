@@ -1,0 +1,2 @@
+# Generated PDF fixtures contain specification-required xref line padding.
+benchmarks/fixtures/*.pdf binary

@@ -3,34 +3,81 @@
 # The sample only ever exists unzipped inside this container's /work volume.
 set -euo pipefail
 
-mkdir -p /work/home/.cache /work/samples/original /work/samples/derived /work/out /work/ghidra /work/scratch
+mkdir -p /work/home/.cache /work/samples/original /work/samples/derived /work/out /work/state /work/ghidra /work/scratch
 [ -L /work/home/.cache/chroma ] || ln -s "$CHROMA_CACHE" /work/home/.cache/chroma
+
+minimum_free=${BW_MIN_FREE_BYTES:-268435456}
+if ! bw-reliability --check-space --work /work --min-free-bytes "$minimum_free" >/dev/null; then
+  echo "bw-init: insufficient free space in the retained case volume" >&2
+  echo "bw-init: action: run 'blackwall diagnose <case>', review scratch candidates, and preserve /work/state, /work/samples, and /work/ghidra" >&2
+  exit 1
+fi
 
 zip=/case/sample.zip
 expected=${1:-}
 if [ ! -f "$zip" ]; then
-  echo "bw-init: $zip missing" >&2; exit 1
+  echo "bw-init: $zip missing" >&2
+  echo "bw-init: action: restore the case's password-protected sample.zip; retained evidence was not changed" >&2
+  exit 1
 fi
 
-if [ -z "$(ls -A /work/samples/original)" ]; then
+mapfile -t existing < <(find /work/samples/original -maxdepth 1 -type f ! -name '.*' -print)
+if [ "${#existing[@]}" -eq 0 ]; then
+  if ! 7z t -p"${BW_ZIP_PASSWORD:-infected}" "$zip" >/dev/null 2>&1; then
+    echo "bw-init: sample.zip is corrupt, truncated, or has the wrong password" >&2
+    echo "bw-init: action: replace the case archive and retry; retained evidence and any prior Ghidra project were not deleted" >&2
+    exit 1
+  fi
+
+  tmp=
+  metadata_tmp=
+  cleanup_partial() {
+    [ -z "$tmp" ] || rm -rf -- "$tmp"
+    [ -z "$metadata_tmp" ] || rm -f -- "$metadata_tmp"
+  }
+  trap cleanup_partial EXIT
   tmp=$(mktemp -d /work/scratch/extract.XXXX)
-  7z x -y -p"${BW_ZIP_PASSWORD:-infected}" -o"$tmp" "$zip" >/dev/null
+  if ! 7z x -y -p"${BW_ZIP_PASSWORD:-infected}" -o"$tmp" "$zip" >/dev/null 2>&1; then
+    echo "bw-init: validated archive could not be extracted" >&2
+    echo "bw-init: action: run 'blackwall diagnose <case>' and check free space; no retained evidence was removed" >&2
+    exit 1
+  fi
   mapfile -t files < <(find "$tmp" -type f)
   if [ "${#files[@]}" -ne 1 ]; then
     echo "bw-init: expected exactly one file in sample.zip, found ${#files[@]}" >&2
     printf '  %s\n' "${files[@]#$tmp/}" >&2
+    echo "bw-init: action: rebuild sample.zip with exactly one regular file" >&2
     exit 1
   fi
   actual=$(sha256sum "${files[0]}" | cut -d' ' -f1)
   if [ -n "$expected" ] && [ "$actual" != "$expected" ]; then
     echo "bw-init: sha256 mismatch: zip contains $actual, case is $expected" >&2
+    echo "bw-init: action: restore the archive matching case.json; retained evidence was not changed" >&2
     exit 1
   fi
   # Name the working copy by hash; keep the original name as metadata only.
   name=$(basename "${files[0]}")
+  metadata_tmp=$(mktemp /work/samples/original/.meta.json.XXXX)
+  printf '{"sha256": "%s", "original_name": %s}\n' \
+    "$actual" "$(jq -Rn --arg n "$name" '$n')" > "$metadata_tmp"
   mv "${files[0]}" "/work/samples/original/$actual"
   chmod 0444 "/work/samples/original/$actual"
-  printf '{"sha256": "%s", "original_name": %s}\n' "$actual" "$(jq -Rn --arg n "$name" '$n')" > /work/samples/original/.meta.json
-  rm -rf "$tmp"
+  mv "$metadata_tmp" /work/samples/original/.meta.json
+  metadata_tmp=
+  cleanup_partial
+  tmp=
+  trap - EXIT
+elif [ "${#existing[@]}" -ne 1 ]; then
+  echo "bw-init: retained original directory has ${#existing[@]} sample files; refusing to guess which one belongs to the case" >&2
+  echo "bw-init: action: run 'blackwall diagnose <case>' and preserve the volume before repair" >&2
+  exit 1
+else
+  actual=$(sha256sum "${existing[0]}" | cut -d' ' -f1)
+  if [ "$(basename "${existing[0]}")" != "$actual" ] || \
+      { [ -n "$expected" ] && [ "$actual" != "$expected" ]; }; then
+    echo "bw-init: retained original sample failed its content-address check" >&2
+    echo "bw-init: action: stop analysis and copy the volume before repair; evidence was not deleted" >&2
+    exit 1
+  fi
 fi
-ls -1 /work/samples/original
+find /work/samples/original -maxdepth 1 -type f ! -name '.*' -printf '%f\n'

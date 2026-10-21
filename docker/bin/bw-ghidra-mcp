@@ -1,46 +1,91 @@
 #!/bin/bash
-# Ghidra MCP over stdio. With --gui, run pyghidra-mcp with the Ghidra GUI
-# (needs streamable-http) and bridge it to stdio with mcp-proxy. The HTTP
-# listener lives on 127.0.0.1 inside a --network none netns, so nothing
-# outside this container can reach it.
+# Maintain one loopback-only Ghidra MCP service per case and bridge it to the
+# caller's stdio.  The bridge is not opened until an actual MCP tool call shows
+# that every imported program has completed Ghidra analysis.
 set -euo pipefail
-args=(--project-path /work/ghidra --project-name case)
-mapfile -t samples < <(find /work/samples/original -maxdepth 1 -type f ! -name '.*')
 
-# Ghidra locks the project exclusively. A server whose client went away
-# uncleanly (killed `docker exec`, crashed session) keeps running inside the
-# container and holds that lock, so the newest session wins: ask old servers
-# to save and exit (SIGINT = clean save-and-close), then force, then clear
-# a lock nobody holds.
+export GHIDRA_INSTALL_DIR="${GHIDRA_INSTALL_DIR:-/opt/ghidra}"
+port=${BW_GHIDRA_PORT:-8000}
+ready_timeout=${BW_GHIDRA_READY_TIMEOUT:-900}
+url="http://127.0.0.1:$port/mcp"
+mode=headless
+[ "${1:-}" = "--gui" ] && mode=gui
+
+args=(--project-path /work/ghidra --project-name case)
+mapfile -t samples < <(find /work/samples/original -maxdepth 1 -type f ! -name '.*' -print | sort)
+state=/work/state/ghidra-service
+pid_file="$state.pid"
+mode_file="$state.mode"
+ready_file=/work/state/ghidra-readiness.json
+log=/work/out/pyghidra-mcp.log
 PYG='^/opt/venv/bin/python3 /opt/venv/bin/pyghidra-mcp'
-evict_stale() {  # $1: regex of servers to stop
-  pkill -INT -f "$1" || return 0
+
+mkdir -p /work/state /work/out /work/ghidra
+exec 9>/work/state/ghidra-service.lock
+flock 9
+
+server_pid() {
+  [ -r "$pid_file" ] || return 1
+  local pid
+  read -r pid < "$pid_file"
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -q '/opt/venv/bin/pyghidra-mcp' \
+    || return 1
+  printf '%s\n' "$pid"
+}
+
+server_healthy() {
+  server_pid >/dev/null || return 1
+  [ "$(cat "$mode_file" 2>/dev/null || true)" = "$mode" ] || return 1
+  curl --max-time 2 -s -o /dev/null "$url"
+}
+
+evict_stale() {
+  local pid
+  pid=$(server_pid 2>/dev/null || true)
+  if [ -n "$pid" ]; then
+    kill -INT "$pid" 2>/dev/null || true
+  else
+    pkill -INT -f "$PYG" 2>/dev/null || true
+  fi
   for _ in $(seq 1 30); do
-    pgrep -f "$1" >/dev/null || return 0
+    pgrep -f "$PYG" >/dev/null || break
     sleep 1
   done
-  pkill -KILL -f "$1" || true
-  sleep 1
-}
-clear_dead_lock() {
-  pgrep -f "$PYG" >/dev/null || rm -f /work/ghidra/case.lock /work/ghidra/case.lock~
+  pgrep -f "$PYG" >/dev/null && pkill -KILL -f "$PYG" 2>/dev/null || true
+  rm -f "$pid_file" "$mode_file"
 }
 
-if [ "${1:-}" = "--gui" ]; then
-  port=8000
-  evict_stale "$PYG.* -t stdio"   # a GUI server persists across sessions; headless ones don't
-  clear_dead_lock
-  if ! curl -s -o /dev/null "http://127.0.0.1:$port/mcp"; then
-    nohup pyghidra-mcp "${args[@]}" --gui -t streamable-http -p $port "${samples[@]}" \
-      > /work/out/pyghidra-mcp-gui.log 2>&1 &
-    for _ in $(seq 1 180); do
-      curl -s -o /dev/null "http://127.0.0.1:$port/mcp" && break
-      sleep 1
-    done
-  fi
-  exec bw-stdio-guard mcp-proxy --transport streamablehttp "http://127.0.0.1:$port/mcp"
+if ! server_healthy; then
+  evict_stale
+  # Only remove a lock after proving that no Ghidra server still owns it.
+  pgrep -f "$PYG" >/dev/null || rm -f /work/ghidra/case.lock /work/ghidra/case.lock~
+  server_args=("${args[@]}" --wait-for-analysis -t streamable-http -p "$port")
+  [ "$mode" = gui ] && server_args+=(--gui)
+  nohup pyghidra-mcp "${server_args[@]}" "${samples[@]}" >"$log" 2>&1 </dev/null &
+  pid=$!
+  printf '%s\n' "$pid" > "$pid_file"
+  printf '%s\n' "$mode" > "$mode_file"
 fi
 
-evict_stale "$PYG"
-clear_dead_lock
-exec bw-stdio-guard pyghidra-mcp "${args[@]}" -t stdio "${samples[@]}" 2>>/work/out/pyghidra-mcp.log
+pid=$(server_pid 2>/dev/null || true)
+if [ -z "$pid" ]; then
+  echo "bw-ghidra-mcp: Ghidra service exited during startup; retained project was not deleted" >&2
+  echo "bw-ghidra-mcp: inspect $log or run: blackwall diagnose <case>" >&2
+  tail -n 40 "$log" >&2 || true
+  evict_stale
+  exit 1
+fi
+if ! bw-ghidra-ready --url "$url" --timeout "$ready_timeout" --watch-pid "$pid" \
+    --state-file "$ready_file" >&2; then
+  echo "bw-ghidra-mcp: Ghidra did not become ready; retained project was not deleted" >&2
+  echo "bw-ghidra-mcp: inspect $log or run: blackwall diagnose <case>" >&2
+  tail -n 40 "$log" >&2 || true
+  evict_stale
+  exit 1
+fi
+
+flock -u 9
+exec 9>&-
+exec bw-stdio-guard mcp-proxy --transport streamablehttp "$url"

@@ -11,6 +11,30 @@ from blackwall_lab import server
 
 
 class ServerHelperTests(unittest.TestCase):
+    def test_strict_profile_excludes_arbitrary_process_tools(self):
+        self.assertEqual(server.DEFAULT_PROFILE, "strict")
+        strict = server.mcp
+        manifest = server.profile_manifest("strict", strict)
+        tools = set(manifest["tools"])
+
+        self.assertTrue(server.EXPERT_ONLY_TOOLS.isdisjoint(tools))
+        self.assertNotIn("run_python", tools)
+        self.assertNotIn("shell", tools)
+        self.assertEqual(server.STRICT_TOOL_ALLOWLIST, tools)
+        self.assertEqual(manifest["runtime_rea_commands_exposed"], [])
+
+    def test_expert_profile_requires_explicit_process_tools(self):
+        manifest = server.profile_manifest("expert", server.build_mcp("expert"))
+        self.assertTrue(server.EXPERT_ONLY_TOOLS <= set(manifest["tools"]))
+        with self.assertRaisesRegex(ValueError, "unknown analysis profile"):
+            server.build_mcp("permissive")
+
+    def test_strict_profile_audit_fails_closed_on_registry_drift(self):
+        strict = server.build_mcp("strict")
+        strict.add_tool(server.shell)
+        with self.assertRaisesRegex(RuntimeError, "profile registry mismatch"):
+            server.profile_manifest("strict", strict)
+
     def test_run_success(self):
         with tempfile.TemporaryDirectory() as td:
             result = server._run(["sh", "-c", "printf ok"], timeout=2, cwd=Path(td))
@@ -67,12 +91,7 @@ class ServerHelperTests(unittest.TestCase):
 
     def test_rea_allowlist_excludes_runtime_capabilities(self):
         commands = set(server.REA_REQUIRED_COMMANDS)
-        forbidden = {
-            "capture-process", "debug-with-gdb", "debug-with-rizin",
-            "instrument-with-frida", "install-adb-package", "start-adb-app",
-            "capture-browser-scenario", "capture-electron-scenario",
-            "observe-native-calls",
-        }
+        forbidden = set(server.REA_RUNTIME_COMMANDS)
         self.assertTrue(commands.isdisjoint(forbidden))
         self.assertEqual(server.REA_STATIC_WORKFLOWS["go"], "inspect-go-binary")
         self.assertIn("function", server.REA_NATIVE_COMMANDS)
@@ -133,6 +152,34 @@ class ServerHelperTests(unittest.TestCase):
                     path, "native_function", ["function", str(path), "0x2000"], 30,
                 )
         self.assertNotEqual(one["saved_to"], two["saved_to"])
+
+    def test_rea_structured_unsupported_result_normalizes_as_unsupported(self):
+        target = Path("/work/samples/original/sample")
+        completed = {
+            "rc": 1,
+            "stdout": json.dumps({
+                "code": "unsupported_target",
+                "error": "Static provider rejected this input",
+                "message": "Unsupported target format",
+            }),
+            "stderr": "",
+            "seconds": 0.1,
+            "timed_out": False,
+        }
+        with tempfile.TemporaryDirectory() as td:
+            with (
+                patch.object(server, "OUT", Path(td)),
+                patch.object(server, "_run", return_value=completed),
+            ):
+                result = server._rea_run(
+                    target, "artifact", ["inspect-artifact", str(target)], 30,
+                )
+
+        normalized = server.normalize_analysis_result(
+            "triage.rea", "lab.rea_static_analysis", result,
+        )
+        self.assertIn("Unsupported", result["unsupported_format"])
+        self.assertEqual(normalized["status"], "unsupported")
 
     def test_rea_rejects_unknown_workflows_and_option_like_selectors(self):
         with self.assertRaisesRegex(ValueError, "unknown REA static workflow"):

@@ -3,4 +3,7 @@
 !lab/
 !rea-runtime/
 !rules/
+!benchmarks/
 lab/**/__pycache__
+benchmarks/**/__pycache__
+benchmarks/fixtures-src/dotnet/obj

@@ -3,6 +3,11 @@
 Status: design only. BlackWall does not currently expose native sample
 execution. `lab.emulate_windows` is API emulation, not detonation.
 
+The completed static-workspace reliability controls—readiness probes, bounded
+parser process groups, stale-container recreation, and read-only diagnosis—do
+not satisfy this design's isolation or admission requirements. They must not be
+used as a reason to execute a sample in the Docker analysis container.
+
 ## Why the analysis container is not enough
 
 The container is intentionally useful: it contains complex native parsers and

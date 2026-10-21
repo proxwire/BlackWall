@@ -11,12 +11,26 @@ case folders (default `~/BlackWall-cases/<sha256>/`, outside this repo) with
   pinned as ARGs; bump them together.
 - `docker/bin/`: in-container entrypoints (`bw-init`, `bw-*-mcp`,
   `bw-stdio-guard`).
-- `lab/blackwall_lab/`: the `lab` MCP server (`server.py`), the `intel` MCP
-  server (`intel.py`), and the Speakeasy runner (`emu_speakeasy.py`, which runs
-  in a subprocess).
+- `lab/blackwall_lab/`: the `lab` MCP server (`server.py`), deterministic
+  format router (`router.py`), durable evidence/checkpoint ledger
+  (`evidence.py`), process and volume reliability checks (`reliability.py`),
+  Ghidra readiness client (`ghidra_ready.py`), evaluation harness
+  (`benchmark.py`), the `intel` MCP server (`intel.py`), and the Speakeasy
+  runner (`emu_speakeasy.py`, which runs in a subprocess).
 - `analyst/`: the playbook copied into every case on `analyze` (CLAUDE.md,
   skills, permission settings).
+- `benchmarks/`: source-built inert fixtures, manifests, and reproducible
+  three-lane evaluation inputs. Never add live malware bytes here.
+- `docs/`: roadmap, evidence/recovery contracts, benchmark results, and the
+  design-only native-execution boundary.
+- `tests/`: host lifecycle/profile tests and image reliability integration.
 - `rules/yara/`: bundled YARA rules.
+
+## Roadmap handoff
+
+P0 roadmap items 1–5 are complete. Continue with item 6, full .NET analysis,
+and preserve every P0 admission check while adding the new toolchain. See
+`docs/roadmap.md` for acceptance criteria and ordering.
 
 ## Invariants (don't break these)
 - Sample bytes never exist unzipped on the host. Anything that parses the
@@ -26,13 +40,31 @@ case folders (default `~/BlackWall-cases/<sha256>/`, outside this repo) with
   and it never mounts case data.
 - Analyst sessions launch with `--strict-mcp-config` and host Bash/WebFetch
   denied.
+- `analyze` defaults to the strict profile. Its MCP surface must not include
+  arbitrary process execution; shell, Python, and radare2 remain behind the
+  explicit `--profile expert` opt-in.
+- Format detection must remain bounded and deterministic. Native PE/ELF plans
+  keep persistent Ghidra primary, broad duplicate REA passes stay opt-in, and
+  every non-success state remains explicit and continuable.
+- Every planned result is evidence-recorded against its stable plan ID. Derived
+  bytes require a parent lineage edge, and material report/annotation claims
+  require evidence links that pass the case audit.
+- Parser descendants must remain in a supervised process group. Timeout,
+  cancellation, and signal crash are distinct continuable evidence gaps.
+  Diagnostics may identify scratch cleanup candidates but never remove retained
+  state, samples, or the persistent Ghidra project.
 
 ## Dev loop
 - `docker build --build-arg UID=$(id -u) --build-arg GID=$(id -g) -t blackwall:latest -f docker/Dockerfile .`
   (the lab/bin layers are last, so rebuilds are fast).
-- `blackwall doctor`.
+- `./blackwall doctor`; use `./blackwall doctor --profile expert` when changing
+  the opt-in surface.
+- Run `bash tests/test_profiles.sh`, `bash tests/test_reliability.sh`, and the
+  Python unit suite before an image build. Run
+  `bash tests/test_image_reliability.sh blackwall:latest` after rebuilding.
 - Test with benign binaries (e.g. UPX-pack something from
   `/usr/share/windows-resources/binaries`), using `blackwall add` and then
   `blackwall analyze`.
-- An existing sandbox keeps the old image: `docker rm -f bw-<id>` (the volume
-  survives) and start again.
+- `start` and `analyze` automatically replace a stale container while retaining
+  the named volume. Use `blackwall diagnose <id>` first when recovery is
+  unclear; diagnostics never clean up evidence automatically.

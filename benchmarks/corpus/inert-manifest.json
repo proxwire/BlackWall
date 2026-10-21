@@ -1,0 +1,576 @@
+{
+  "description": "Source-built fixtures that contain no executable behavior beyond returning constants.",
+  "fixtures": [
+    {
+      "expected": {
+        "configuration": [
+          "campaign=native-inert"
+        ],
+        "iocs": [
+          "https://native.fixture.invalid/api"
+        ],
+        "report_claims": [
+          {
+            "id": "fixture-identity",
+            "terms": [
+              "BLACKWALL_INERT_NATIVE_FIXTURE"
+            ]
+          },
+          {
+            "id": "endpoint",
+            "terms": [
+              "https://native.fixture.invalid/api"
+            ]
+          },
+          {
+            "id": "configuration",
+            "terms": [
+              "campaign=native-inert"
+            ]
+          }
+        ],
+        "router_format": "pe",
+        "useful_evidence": [
+          {
+            "id": "fixture-marker",
+            "terms": [
+              "BLACKWALL_INERT_NATIVE_FIXTURE"
+            ]
+          }
+        ]
+      },
+      "format": "pe",
+      "id": "native-pe",
+      "labels": [
+        "windows",
+        "native"
+      ],
+      "path": "../fixtures/native-pe.pe",
+      "raw_rea": {
+        "workflow": "native_overview"
+      },
+      "sha256": "2b8452597a58f23ae58796d3f7db7efa474d555c0be34ca167ada38319bc07d9",
+      "size": 15360
+    },
+    {
+      "expected": {
+        "configuration": [
+          "campaign=native-inert"
+        ],
+        "iocs": [
+          "https://native.fixture.invalid/api"
+        ],
+        "packing_state": "likely_packed",
+        "report_claims": [
+          {
+            "id": "fixture-identity",
+            "terms": [
+              "BLACKWALL_INERT_NATIVE_FIXTURE"
+            ]
+          },
+          {
+            "id": "endpoint",
+            "terms": [
+              "https://native.fixture.invalid/api"
+            ]
+          },
+          {
+            "id": "configuration",
+            "terms": [
+              "campaign=native-inert"
+            ]
+          }
+        ],
+        "router_format": "pe",
+        "useful_evidence": [
+          {
+            "id": "fixture-marker",
+            "terms": [
+              "BLACKWALL_INERT_NATIVE_FIXTURE"
+            ]
+          }
+        ]
+      },
+      "format": "pe",
+      "id": "packed-pe",
+      "labels": [
+        "windows",
+        "native",
+        "upx"
+      ],
+      "path": "../fixtures/packed-pe.pe",
+      "raw_rea": {
+        "workflow": "native_overview"
+      },
+      "sha256": "b49a928882d4821237bdc2f632943f9978a4b6a89208c72b6ac3c81e2d9a41a1",
+      "size": 7680
+    },
+    {
+      "expected": {
+        "configuration": [
+          "campaign=dotnet-inert"
+        ],
+        "iocs": [
+          "https://dotnet.fixture.invalid/api"
+        ],
+        "report_claims": [
+          {
+            "id": "fixture-identity",
+            "terms": [
+              "BLACKWALL_INERT_DOTNET_FIXTURE"
+            ]
+          },
+          {
+            "id": "endpoint",
+            "terms": [
+              "https://dotnet.fixture.invalid/api"
+            ]
+          },
+          {
+            "id": "configuration",
+            "terms": [
+              "campaign=dotnet-inert"
+            ]
+          }
+        ],
+        "router_format": "dotnet",
+        "useful_evidence": [
+          {
+            "id": "fixture-marker",
+            "terms": [
+              "BLACKWALL_INERT_DOTNET_FIXTURE"
+            ]
+          }
+        ]
+      },
+      "format": "dotnet",
+      "id": "dotnet",
+      "labels": [
+        "windows",
+        "managed"
+      ],
+      "path": "../fixtures/dotnet.pe",
+      "raw_rea": {
+        "workflow": "managed"
+      },
+      "sha256": "174d69263319c8c4d46b8cef752d4c29e4fd31a00c92bbeb20de6df2bf220f93",
+      "size": 4096
+    },
+    {
+      "expected": {
+        "configuration": [
+          "campaign=native-inert"
+        ],
+        "iocs": [
+          "https://native.fixture.invalid/api"
+        ],
+        "report_claims": [
+          {
+            "id": "fixture-identity",
+            "terms": [
+              "BLACKWALL_INERT_NATIVE_FIXTURE"
+            ]
+          },
+          {
+            "id": "endpoint",
+            "terms": [
+              "https://native.fixture.invalid/api"
+            ]
+          },
+          {
+            "id": "configuration",
+            "terms": [
+              "campaign=native-inert"
+            ]
+          }
+        ],
+        "router_format": "elf",
+        "useful_evidence": [
+          {
+            "id": "fixture-marker",
+            "terms": [
+              "BLACKWALL_INERT_NATIVE_FIXTURE"
+            ]
+          }
+        ]
+      },
+      "format": "elf",
+      "id": "elf",
+      "labels": [
+        "linux",
+        "native"
+      ],
+      "path": "../fixtures/native-elf.elf",
+      "raw_rea": {
+        "workflow": "native_overview"
+      },
+      "sha256": "45d3f6f84623909992a27016e29bf3275f56ea609f3b1a61a06adceb7ef92725",
+      "size": 14304
+    },
+    {
+      "expected": {
+        "configuration": [
+          "campaign=apk-inert"
+        ],
+        "iocs": [
+          "https://apk.fixture.invalid/api"
+        ],
+        "report_claims": [
+          {
+            "id": "fixture-identity",
+            "terms": [
+              "BLACKWALL_INERT_APK_FIXTURE"
+            ]
+          },
+          {
+            "id": "endpoint",
+            "terms": [
+              "https://apk.fixture.invalid/api"
+            ]
+          },
+          {
+            "id": "configuration",
+            "terms": [
+              "campaign=apk-inert"
+            ]
+          }
+        ],
+        "router_format": "apk",
+        "useful_evidence": [
+          {
+            "id": "fixture-marker",
+            "terms": [
+              "BLACKWALL_INERT_APK_FIXTURE"
+            ]
+          }
+        ]
+      },
+      "format": "apk",
+      "id": "apk",
+      "labels": [
+        "android",
+        "mobile"
+      ],
+      "path": "../fixtures/fixture.apk",
+      "raw_rea": {
+        "workflow": "android"
+      },
+      "sha256": "00e0412d558ab742a3ce38f370830288764566bd96904336241b453847929d30",
+      "size": 1197
+    },
+    {
+      "expected": {
+        "configuration": [
+          "campaign: \"javascript-inert\""
+        ],
+        "iocs": [
+          "https://javascript.fixture.invalid/api"
+        ],
+        "report_claims": [
+          {
+            "id": "fixture-identity",
+            "terms": [
+              "BLACKWALL_INERT_JAVASCRIPT_FIXTURE"
+            ]
+          },
+          {
+            "id": "endpoint",
+            "terms": [
+              "https://javascript.fixture.invalid/api"
+            ]
+          },
+          {
+            "id": "configuration",
+            "terms": [
+              "campaign: \"javascript-inert\""
+            ]
+          }
+        ],
+        "router_format": "javascript",
+        "useful_evidence": [
+          {
+            "id": "fixture-marker",
+            "terms": [
+              "BLACKWALL_INERT_JAVASCRIPT_FIXTURE"
+            ]
+          }
+        ]
+      },
+      "format": "javascript",
+      "id": "javascript",
+      "labels": [
+        "script"
+      ],
+      "path": "../fixtures/javascript.js",
+      "raw_rea": {
+        "workflow": "javascript"
+      },
+      "sha256": "839b81c34f51386001654d8c205cf7a4e3aef8916602c5aedc6d7dad4dce5e67",
+      "size": 326
+    },
+    {
+      "expected": {
+        "configuration": [
+          "campaign=wasm-inert"
+        ],
+        "iocs": [
+          "https://wasm.fixture.invalid/api"
+        ],
+        "report_claims": [
+          {
+            "id": "fixture-identity",
+            "terms": [
+              "BLACKWALL_INERT_WASM_FIXTURE"
+            ]
+          },
+          {
+            "id": "endpoint",
+            "terms": [
+              "https://wasm.fixture.invalid/api"
+            ]
+          },
+          {
+            "id": "configuration",
+            "terms": [
+              "campaign=wasm-inert"
+            ]
+          }
+        ],
+        "router_format": "wasm",
+        "useful_evidence": [
+          {
+            "id": "fixture-marker",
+            "terms": [
+              "BLACKWALL_INERT_WASM_FIXTURE"
+            ]
+          }
+        ]
+      },
+      "format": "wasm",
+      "id": "wasm",
+      "labels": [
+        "bytecode"
+      ],
+      "path": "../fixtures/module.wasm",
+      "raw_rea": {
+        "workflow": "wasm"
+      },
+      "sha256": "205d198d12f407cf80210ba88e84d463dd22892c0429e3710873d1b1e374f930",
+      "size": 150
+    },
+    {
+      "expected": {
+        "configuration": [
+          "campaign=office-inert"
+        ],
+        "iocs": [
+          "https://office.fixture.invalid/api"
+        ],
+        "report_claims": [
+          {
+            "id": "fixture-identity",
+            "terms": [
+              "BLACKWALL_INERT_OFFICE_FIXTURE"
+            ]
+          },
+          {
+            "id": "endpoint",
+            "terms": [
+              "https://office.fixture.invalid/api"
+            ]
+          },
+          {
+            "id": "configuration",
+            "terms": [
+              "campaign=office-inert"
+            ]
+          }
+        ],
+        "router_format": "ooxml-word",
+        "useful_evidence": [
+          {
+            "id": "fixture-marker",
+            "terms": [
+              "BLACKWALL_INERT_OFFICE_FIXTURE"
+            ]
+          }
+        ]
+      },
+      "format": "ooxml-word",
+      "id": "office",
+      "labels": [
+        "document",
+        "office"
+      ],
+      "path": "../fixtures/office.docx",
+      "raw_rea": {
+        "workflow": "artifact"
+      },
+      "sha256": "6c9c9af7d0d88b890564251f267bd43fccda44635444705483d2a67a95edf386",
+      "size": 1320
+    },
+    {
+      "expected": {
+        "configuration": [
+          "campaign=rtf-inert"
+        ],
+        "iocs": [
+          "https://rtf.fixture.invalid/api"
+        ],
+        "report_claims": [
+          {
+            "id": "fixture-identity",
+            "terms": [
+              "BLACKWALL_INERT_RTF_FIXTURE"
+            ]
+          },
+          {
+            "id": "endpoint",
+            "terms": [
+              "https://rtf.fixture.invalid/api"
+            ]
+          },
+          {
+            "id": "configuration",
+            "terms": [
+              "campaign=rtf-inert"
+            ]
+          }
+        ],
+        "router_format": "rtf",
+        "useful_evidence": [
+          {
+            "id": "fixture-marker",
+            "terms": [
+              "BLACKWALL_INERT_RTF_FIXTURE"
+            ]
+          }
+        ]
+      },
+      "format": "rtf",
+      "id": "rtf",
+      "labels": [
+        "document"
+      ],
+      "path": "../fixtures/document.rtf",
+      "raw_rea": {
+        "workflow": "artifact"
+      },
+      "sha256": "5dc0ca6f6407df6b166793442acf27aec9f1c1138b4a02274937903e8419a496",
+      "size": 91
+    },
+    {
+      "expected": {
+        "configuration": [
+          "campaign=pdf-inert"
+        ],
+        "iocs": [
+          "https://pdf.fixture.invalid/api"
+        ],
+        "report_claims": [
+          {
+            "id": "fixture-identity",
+            "terms": [
+              "BLACKWALL_INERT_PDF_FIXTURE"
+            ]
+          },
+          {
+            "id": "endpoint",
+            "terms": [
+              "https://pdf.fixture.invalid/api"
+            ]
+          },
+          {
+            "id": "configuration",
+            "terms": [
+              "campaign=pdf-inert"
+            ]
+          }
+        ],
+        "router_format": "pdf",
+        "useful_evidence": [
+          {
+            "id": "fixture-marker",
+            "terms": [
+              "BLACKWALL_INERT_PDF_FIXTURE"
+            ]
+          }
+        ]
+      },
+      "format": "pdf",
+      "id": "pdf",
+      "labels": [
+        "document"
+      ],
+      "path": "../fixtures/document.pdf",
+      "raw_rea": {
+        "workflow": "artifact"
+      },
+      "sha256": "bd2019b44b90ddd9f77e24c34d1f6dc4a8896569c57d10c468f2b30581519317",
+      "size": 690
+    },
+    {
+      "expected": {
+        "configuration": [
+          "campaign=pcap-inert"
+        ],
+        "iocs": [
+          "https://pcap.fixture.invalid/api"
+        ],
+        "report_claims": [
+          {
+            "id": "fixture-identity",
+            "terms": [
+              "BLACKWALL_INERT_PCAP_FIXTURE"
+            ]
+          },
+          {
+            "id": "endpoint",
+            "terms": [
+              "https://pcap.fixture.invalid/api"
+            ]
+          },
+          {
+            "id": "configuration",
+            "terms": [
+              "campaign=pcap-inert"
+            ]
+          }
+        ],
+        "router_format": "pcap",
+        "useful_evidence": [
+          {
+            "id": "fixture-marker",
+            "terms": [
+              "BLACKWALL_INERT_PCAP_FIXTURE"
+            ]
+          }
+        ]
+      },
+      "format": "pcap",
+      "id": "pcap",
+      "labels": [
+        "capture",
+        "network"
+      ],
+      "path": "../fixtures/capture.pcap",
+      "raw_rea": {
+        "workflow": "pcap"
+      },
+      "sha256": "d5eb55bf4ba1c05b6881b93da7af9ae0951b9c789c4bd4b24592651f1a881fe1",
+      "size": 163
+    }
+  ],
+  "generated_by": "benchmarks/build_corpus.py",
+  "id": "blackwall-inert-v1",
+  "kind": "inert",
+  "network_policy": "offline",
+  "schema": "blackwall.benchmark-corpus.v1",
+  "toolchain": {
+    "dotnet": "6.0.400",
+    "gcc": "gcc (Debian 16.2.0-3) 16.2.0",
+    "mingw": "x86_64-w64-mingw32-gcc (GCC) 16-win32",
+    "smali": "smali 2.5.2.git2771eae-debian (http://smali.org)",
+    "upx": "upx 4.2.4"
+  }
+}

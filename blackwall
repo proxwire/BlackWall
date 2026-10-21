@@ -15,6 +15,8 @@ CASES="${BLACKWALL_CASES:-$HOME/BlackWall-cases}"
 MEM="${BLACKWALL_MEM:-8g}"
 CPUS="${BLACKWALL_CPUS:-4}"
 ZIP_PW="infected"
+DEFAULT_ANALYSIS_PROFILE="strict"
+SANDBOX_SPEC="2"
 
 c_red=$'\e[31m'; c_grn=$'\e[32m'; c_yel=$'\e[33m'; c_dim=$'\e[2m'; c_off=$'\e[0m'
 die()  { echo "${c_red}error:${c_off} $*" >&2; exit 1; }
@@ -28,17 +30,22 @@ BlackWall — AI-driven malware analysis lab
 usage: blackwall <command> [args]
 
   setup                    build the analysis image and check the host
-  doctor                   check host prerequisites and image health
+  doctor [--profile strict|expert]
+                           check host prerequisites, image health, and profile policy
   pull <sha256>            fetch a sample from MalwareBazaar (needs ABUSECH_API_KEY)
   add <file>               add a local sample (zipped with password '$ZIP_PW')
   list                     list cases
-  analyze <id> [--gui] [--auto] [-- <claude args>]
+  analyze <id> [--gui] [--auto] [--profile strict|expert] [-- <claude args>]
                            start the sandbox and launch Claude Code in the case
                              --gui   also open Ghidra's GUI (X11) driven by the same MCP session
                              --auto  start with an autonomous triage → deep-dive prompt
-  start <id> [--gui]       start the sandbox only
+                             --profile strict (default) excludes arbitrary process tools
+                             --profile expert explicitly enables shell, Python, and radare2
+  start <id> [--gui] [--profile strict|expert]
+                           start the sandbox and write its profile-specific MCP config
   stop <id>                stop the sandbox (analysis state is kept)
   shell <id>               open a shell inside the sandbox
+  diagnose <id>            inspect reliability/cleanup state without deleting evidence
   rm <id> [--purge]        delete sandbox + its volume (--purge also deletes the case dir)
 
 <id> is any unique prefix of the sample's sha256.
@@ -73,7 +80,42 @@ new_case_dir() {
 
 write_case_json() {  # sha source original_name
   jq -n --arg sha "$1" --arg src "$2" --arg name "$3" --arg t "$(date -u +%FT%TZ)" \
-    '{sha256:$sha, source:$src, original_name:$name, added:$t}' > "$CASES/$1/case.json"
+    --arg profile "$DEFAULT_ANALYSIS_PROFILE" \
+    '{sha256:$sha, source:$src, original_name:$name, added:$t,
+      analysis_profile:{name:$profile, selected_at:null}}' > "$CASES/$1/case.json"
+}
+
+validate_profile_name() {
+  case "$1" in
+    strict|expert) ;;
+    *) die "unknown analysis profile '$1' (choose strict or expert)" ;;
+  esac
+}
+
+record_case_profile() {  # sha profile
+  local sha=$1 profile=$2 path tmp selected_at
+  path="$CASES/$sha/case.json"
+  [ -f "$path" ] || die "case metadata missing: $path"
+  selected_at=$(date -u +%FT%TZ)
+  tmp=$(mktemp "$CASES/$sha/.case.json.XXXXXX")
+  if ! jq --arg profile "$profile" --arg selected_at "$selected_at" '
+      .analysis_profile = {name:$profile, selected_at:$selected_at}
+      | .analysis_profile_history = ((.analysis_profile_history // [])
+          + [{name:$profile, selected_at:$selected_at}]
+          | if length > 100 then .[-100:] else . end)
+    ' "$path" > "$tmp"; then
+    rm -f "$tmp"
+    die "could not update case profile metadata"
+  fi
+  mv "$tmp" "$path"
+}
+
+announce_profile() {
+  if [ "$1" = expert ]; then
+    warn "EXPERT PROFILE ENABLED: the analyst can run arbitrary Python, shell, and radare2 operations inside the sample container"
+  else
+    info "analysis profile: strict (arbitrary process tools are not exposed)"
+  fi
 }
 
 container_running() { [ "$(docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null)" = "true" ]; }
@@ -82,18 +124,36 @@ container_uses_current_image() {
   [ "$(docker inspect -f '{{.Image}}' "$1" 2>/dev/null)" = \
     "$(docker image inspect -f '{{.Id}}' "$IMAGE" 2>/dev/null)" ]
 }
+container_label() { docker inspect -f "{{ index .Config.Labels \"$2\" }}" "$1" 2>/dev/null; }
+container_work_volume() {
+  docker inspect -f '{{range .Mounts}}{{if eq .Destination "/work"}}{{.Name}}{{end}}{{end}}' "$1" 2>/dev/null
+}
+container_recreation_reason() {  # container sha volume gui
+  local c=$1 sha=$2 volume=$3 gui=$4
+  if ! container_uses_current_image "$c"; then
+    echo "updated image"
+  elif [ "$(container_label "$c" blackwall.case)" != "$sha" ]; then
+    echo "case-label mismatch"
+  elif [ "$(container_label "$c" blackwall.sandbox-spec)" != "$SANDBOX_SPEC" ]; then
+    echo "sandbox-policy update"
+  elif [ "$(container_label "$c" blackwall.volume)" != "$volume" ] || \
+      [ "$(container_work_volume "$c")" != "$volume" ]; then
+    echo "analysis-volume mismatch"
+  elif [ "$gui" = 1 ] && ! container_gui "$c"; then
+    echo "GUI support requested"
+  fi
+  return 0
+}
 
 start_sandbox() {  # sha gui(0|1)
-  local sha=$1 gui=$2 c v dir
+  local sha=$1 gui=$2 c v dir reason
   c=$(cname "$sha"); v=$(vname "$sha"); dir="$CASES/$sha"
   need_image
 
   if docker inspect "$c" >/dev/null 2>&1; then
-    if ! container_uses_current_image "$c"; then
-      info "recreating sandbox with updated image (analysis state is kept in volume $v)"
-      docker rm -f "$c" >/dev/null
-    elif [ "$gui" = 1 ] && ! container_gui "$c"; then
-      info "recreating sandbox with GUI support (analysis state is kept in volume $v)"
+    reason=$(container_recreation_reason "$c" "$sha" "$v" "$gui")
+    if [ -n "$reason" ]; then
+      info "recreating stale sandbox ($reason); retained analysis state stays in volume $v"
       docker rm -f "$c" >/dev/null
     elif ! container_running "$c"; then
       docker start "$c" >/dev/null
@@ -108,7 +168,7 @@ start_sandbox() {  # sha gui(0|1)
       gui_args=(-e BW_GUI=1 -e DISPLAY="$DISPLAY" -v /tmp/.X11-unix:/tmp/.X11-unix:ro)
     fi
     info "starting sandbox $c (network: none)"
-    docker run -d --init --name "$c" --hostname sandbox \
+    if ! docker run -d --init --name "$c" --hostname sandbox \
       --network none \
       --cap-drop ALL --security-opt no-new-privileges \
       --read-only --tmpfs /tmp:rw,exec,nosuid,nodev,size=4g \
@@ -119,26 +179,67 @@ start_sandbox() {  # sha gui(0|1)
       -v "$dir/exports":/case/exports \
       "${gui_args[@]}" \
       --label blackwall.case="$sha" \
-      "$IMAGE" >/dev/null
+      --label blackwall.volume="$v" \
+      --label blackwall.sandbox-spec="$SANDBOX_SPEC" \
+      "$IMAGE" >/dev/null; then
+      die "sandbox creation failed; retained volume $v was not deleted (run: blackwall diagnose ${sha:0:12})"
+    fi
   fi
-  docker exec "$c" bw-init "$sha" >/dev/null || die "sample extraction failed (see: docker exec $c bw-init $sha)"
+  if ! docker exec "$c" bw-init "$sha" >/dev/null; then
+    warn "initialization failed; retained evidence in volume $v was not deleted"
+    die "inspect recovery guidance with: blackwall diagnose ${sha:0:12}"
+  fi
 }
 
-write_mcp_config() {  # sha gui
-  local sha=$1 gui=$2 c ghidra_args
+make_mcp_config() {  # sha gui profile — emit JSON
+  local sha=$1 gui=$2 profile=$3 c ghidra_args
+  validate_profile_name "$profile"
   c=$(cname "$sha")
   ghidra_args='["exec","-i","'"$c"'","bw-ghidra-mcp"]'
   [ "$gui" = 1 ] && ghidra_args='["exec","-i","'"$c"'","bw-ghidra-mcp","--gui"]'
-  jq -n --argjson ga "$ghidra_args" --arg c "$c" --arg img "$IMAGE" '{
-    mcpServers: {
+  jq -n --argjson ga "$ghidra_args" --arg c "$c" --arg img "$IMAGE" \
+    --arg profile "$profile" '{
+    mcpServers: ({
       ghidra:  {command: "docker", args: $ga},
-      lab:     {command: "docker", args: ["exec","-i",$c,"bw-lab-mcp"]},
-      radare2: {command: "docker", args: ["exec","-i",$c,"bw-r2mcp"]},
+      lab:     {command: "docker", args: ["exec","-i",$c,"bw-lab-mcp","--profile",$profile]},
       intel:   {command: "docker", args: ["run","--rm","-i","--cap-drop","ALL",
                   "--security-opt","no-new-privileges","--read-only","--tmpfs","/tmp",
                   "-e","HOME=/tmp","-e","ABUSECH_API_KEY","-e","VT_API_KEY",
                   $img,"bw-intel-mcp"]}
-    }}' > "$CASES/$sha/.mcp.json"
+    } + (if $profile == "expert" then {
+      radare2: {command: "docker", args: ["exec","-i",$c,"bw-r2mcp"]}
+    } else {} end))}'
+}
+
+write_mcp_config() {  # sha gui profile
+  make_mcp_config "$1" "$2" "$3" > "$CASES/$1/.mcp.json"
+}
+
+mcp_config_profile_valid() {  # profile
+  local profile=$1 fixture
+  fixture=$(make_mcp_config "0000000000000000000000000000000000000000000000000000000000000000" 0 "$profile")
+  if [ "$profile" = strict ]; then
+    jq -e --arg profile "$profile" '
+      (.mcpServers | keys) == ["ghidra", "intel", "lab"]
+      and .mcpServers.lab.args[-2:] == ["--profile", $profile]
+    ' <<<"$fixture" >/dev/null
+  else
+    jq -e --arg profile "$profile" '
+      (.mcpServers | keys) == ["ghidra", "intel", "lab", "radare2"]
+      and .mcpServers.lab.args[-2:] == ["--profile", $profile]
+    ' <<<"$fixture" >/dev/null
+  fi
+}
+
+analyst_policy_valid() {
+  jq -e '
+    (["Bash", "WebFetch", "WebSearch",
+      "Edit(./.claude/**)", "Write(./.claude/**)",
+      "Edit(./.mcp.json)", "Write(./.mcp.json)",
+      "Edit(./CLAUDE.md)", "Write(./CLAUDE.md)",
+      "Edit(./case.json)", "Write(./case.json)"]
+      - .permissions.deny | length) == 0
+  ' "$BW_ROOT/analyst/.claude/settings.json" >/dev/null
 }
 
 sync_playbook() {  # sha — refresh the analyst playbook (CLAUDE.md, skills, settings)
@@ -150,17 +251,64 @@ sync_playbook() {  # sha — refresh the analyst playbook (CLAUDE.md, skills, se
   cp "$BW_ROOT/analyst/.claude/settings.json" "$dir/.claude/settings.json"
 }
 
+stamp_report_profile() {  # sha profile — make the report record the selected boundary
+  local sha=$1 profile=$2 report tmp selected_at
+  report="$CASES/$sha/report.md"
+  [ -f "$report" ] || return 0
+  selected_at=$(jq -r '.analysis_profile.selected_at // "unknown"' "$CASES/$sha/case.json")
+  tmp=$(mktemp "$CASES/$sha/.report.md.XXXXXX")
+  if grep -q '^<!-- blackwall-analysis-profile -->$' "$report"; then
+    awk -v line="> BlackWall analysis profile: \`$profile\` (selected $selected_at)." '
+      $0 == "<!-- blackwall-analysis-profile -->" {
+        print
+        print line
+        skip_old_profile = 1
+        next
+      }
+      skip_old_profile && /^> BlackWall analysis profile:/ {
+        skip_old_profile = 0
+        next
+      }
+      { skip_old_profile = 0; print }
+    ' "$report" > "$tmp"
+  else
+    {
+      printf '<!-- blackwall-analysis-profile -->\n'
+      printf "> BlackWall analysis profile: \`%s\` (selected %s).\n\n" "$profile" "$selected_at"
+      cat "$report"
+    } > "$tmp"
+  fi
+  mv "$tmp" "$report"
+}
+
 # ------------------------------------------------------------------ commands
 
 cmd_doctor() {
-  local ok=1
+  local ok=1 profile=$DEFAULT_ANALYSIS_PROFILE profile_suffix=
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --profile)
+        [ $# -ge 2 ] || die "--profile needs strict or expert"
+        profile=$2
+        validate_profile_name "$profile"
+        shift
+        ;;
+      *) die "unknown doctor option: $1" ;;
+    esac
+    shift
+  done
   check() { if eval "$2" >/dev/null 2>&1; then echo "  ${c_grn}✓${c_off} $1"; else echo "  ${c_red}✗${c_off} $1 ${c_dim}($3)${c_off}"; ok=0; fi; }
   optional() { if eval "$2" >/dev/null 2>&1; then echo "  ${c_grn}✓${c_off} $1"; else echo "  ${c_yel}-${c_off} $1 ${c_dim}($3)${c_off}"; fi; }
+  [ "$profile" = strict ] && profile_suffix=" (default)"
+  echo "analysis profile: $profile$profile_suffix"
   echo "host:"
   check "docker reachable"            "docker info"                        "install docker / add yourself to the docker group"
   check "jq"                          "command -v jq"                      "apt install jq"
   check "claude (Claude Code)"        "command -v claude"                  "https://claude.com/claude-code"
   check "image $IMAGE"                "docker image inspect $IMAGE"        "blackwall setup"
+  check "strict MCP server set"        "mcp_config_profile_valid strict"    "strict config unexpectedly exposes an expert server"
+  check "$profile MCP profile wiring"  "mcp_config_profile_valid '$profile'" "profile was not propagated to the lab server"
+  check "analyst host restrictions"    "analyst_policy_valid"               "host execution, web, and control-file edits must remain denied"
   optional "KVM (for phase-2 dynamic)"   "test -w /dev/kvm"                   "optional for now"
   optional "abuse.ch key (pull/intel)"   "test -n '${ABUSECH_API_KEY:-}'"     "optional; set ABUSECH_API_KEY in $BW_ROOT/.env"
   optional "VirusTotal key (intel)"      "test -n '${VT_API_KEY:-}'"          "optional; set VT_API_KEY in $BW_ROOT/.env"
@@ -169,11 +317,20 @@ cmd_doctor() {
     check "sandbox has no network"    "! docker run --rm --network none $IMAGE curl -s -m 3 https://1.1.1.1" "network leak!"
     check "Ghidra"                    "docker run --rm $IMAGE test -x /opt/ghidra/support/analyzeHeadless" "rebuild"
     check "pyghidra-mcp"              "docker run --rm $IMAGE pyghidra-mcp --version" "rebuild"
-    check "radare2 + r2mcp"           "docker run --rm $IMAGE sh -c 'r2 -v && command -v r2mcp'" "rebuild"
+    check "Ghidra readiness probe"    "docker run --rm --network none $IMAGE bw-ghidra-ready --self-check" "readiness result parsing failed"
+    check "failure supervision"       "docker run --rm --network none $IMAGE bw-reliability --self-check" "timeout, cancellation, crash, or cleanup preservation failed"
+    check "radare2 + r2mcp (expert)"  "docker run --rm $IMAGE sh -c 'r2 -v && command -v r2mcp'" "rebuild"
     check "capa / floss / diec / upx" "docker run --rm $IMAGE sh -c 'capa --version && floss --version && command -v diec upx'" "rebuild"
     check "REA static lane"          "docker run --rm --network none $IMAGE sh -c '/opt/rea/runtime/node_modules/.bin/rea inspect-go-binary /bin/true --format json | jq -e . >/dev/null'" "rebuild"
     check "REA safety profile"       "docker run --rm $IMAGE sh -c 'test \"\$(/opt/rea/runtime/node_modules/.bin/rea --version)\" = 6.7.0 && test -r \"\$REA_JADX_MCP_JAR\" && test ! -d /opt/rea/runtime/node_modules/frida && ! command -v rea && command -v ps'" "rebuild"
     check "REA command manifest"      "docker run --rm $IMAGE python -c 'from blackwall_lab.server import _validate_rea_command_manifest as validate; validate()'" "rebuild"
+    check "format-aware router"       "docker run --rm --network none $IMAGE bw-lab-mcp --check-router" "router admission self-check failed"
+    check "evidence + resume ledger"  "docker run --rm --network none $IMAGE bw-lab-mcp --check-evidence" "evidence lineage, deduplication, resume, or audit self-check failed"
+    check "benchmark corpus + harness" "docker run --rm --network none $IMAGE bw-benchmark --self-check" "inert corpus integrity or benchmark admission failed"
+    check "strict lab tool profile"   "docker run --rm --network none $IMAGE bw-lab-mcp --profile strict --check-profile" "strict profile includes process execution or lacks required static tools"
+    if [ "$profile" = expert ]; then
+      check "expert lab tool profile" "docker run --rm --network none $IMAGE bw-lab-mcp --profile expert --check-profile" "expert opt-in tools are unavailable"
+    fi
     check "REA static providers"      "docker run --rm $IMAGE sh -c 'test \"\$(\$REA_WABT_BIN_DIRECTORY/wasm-validate --version)\" = 1.0.42 && tshark --version | head -1 | grep -q \"^TShark (Wireshark) 4\\.\" && capinfos --version | head -1 | grep -q \"^Capinfos (Wireshark) 4\\.\" && /opt/rea/runtime/node_modules/.bin/rea inspect-with-objdump /bin/true file_headers --format json | jq -e . >/dev/null'" "rebuild"
     check "lab MCP server imports"    "docker run --rm -e HOME=/tmp $IMAGE python -c 'import blackwall_lab.server, blackwall_lab.intel'" "rebuild"
     check "lab regression tests"      "docker run --rm -e HOME=/tmp $IMAGE python -m unittest discover -s /opt/blackwall/lab/tests" "rebuild"
@@ -182,6 +339,7 @@ cmd_doctor() {
     info "all good"
   else
     warn "some checks failed"
+    return 1
   fi
 }
 
@@ -234,39 +392,63 @@ cmd_add() {
 
 cmd_list() {
   mkdir -p "$CASES"
-  printf '%-14s %-10s %-28s %-8s %s\n' ID SOURCE NAME SANDBOX REPORT
+  printf '%-14s %-10s %-28s %-8s %-8s %s\n' ID SOURCE NAME PROFILE SANDBOX REPORT
   for d in "$CASES"/*/; do
     [ -f "$d/case.json" ] || continue
-    local sha src name state rep
+    local sha src name profile state rep
     sha=$(jq -r .sha256 "$d/case.json"); src=$(jq -r .source "$d/case.json"); name=$(jq -r '.original_name // ""' "$d/case.json")
+    profile=$(jq -r '.analysis_profile.name // "strict"' "$d/case.json")
     if container_running "$(cname "$sha")"; then state=up; elif docker inspect "$(cname "$sha")" >/dev/null 2>&1; then state=stopped; else state=-; fi
     [ -f "$d/report.md" ] && rep=yes || rep=-
-    printf '%-14s %-10s %-28.28s %-8s %s\n' "${sha:0:12}" "$src" "$name" "$state" "$rep"
+    printf '%-14s %-10s %-28.28s %-8s %-8s %s\n' "${sha:0:12}" "$src" "$name" "$profile" "$state" "$rep"
   done
 }
 
 cmd_start() {
-  local sha gui=0; sha=$(resolve "${1:-}"); shift || true
-  [ "${1:-}" = "--gui" ] && gui=1
+  local sha gui=0 profile=$DEFAULT_ANALYSIS_PROFILE
+  sha=$(resolve "${1:-}"); shift || true
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --gui) gui=1 ;;
+      --profile)
+        [ $# -ge 2 ] || die "--profile needs strict or expert"
+        profile=$2
+        validate_profile_name "$profile"
+        shift
+        ;;
+      *) die "unknown option: $1" ;;
+    esac
+    shift
+  done
   start_sandbox "$sha" "$gui"
-  write_mcp_config "$sha" "$gui"
+  write_mcp_config "$sha" "$gui" "$profile"
+  record_case_profile "$sha" "$profile"
+  announce_profile "$profile"
   info "sandbox $(cname "$sha") is up"
 }
 
 cmd_analyze() {
-  local sha gui=0 auto=0 extra=()
+  local sha gui=0 auto=0 profile=$DEFAULT_ANALYSIS_PROFILE rc extra=()
   sha=$(resolve "${1:-}"); shift || true
   while [ $# -gt 0 ]; do
     case "$1" in
       --gui) gui=1 ;; --auto) auto=1 ;;
+      --profile)
+        [ $# -ge 2 ] || die "--profile needs strict or expert"
+        profile=$2
+        validate_profile_name "$profile"
+        shift
+        ;;
       --) shift; extra=("$@"); break ;;
       *) die "unknown option: $1" ;;
     esac; shift
   done
   command -v claude >/dev/null || die "Claude Code (claude) not found"
   start_sandbox "$sha" "$gui"
-  write_mcp_config "$sha" "$gui"
+  write_mcp_config "$sha" "$gui" "$profile"
+  record_case_profile "$sha" "$profile"
   sync_playbook "$sha"
+  announce_profile "$profile"
   info "launching Claude Code in $CASES/$sha"
   [ "$gui" = 1 ] && info "Ghidra GUI opens when the ghidra MCP server starts (first launch can take ~1 min)"
   cd "$CASES/$sha"
@@ -275,14 +457,60 @@ cmd_analyze() {
   # injection hidden in a sample has nothing outside the sandbox to reach.
   # (--mcp-config is variadic, so any prompt has to come before it.)
   local mcp=(--strict-mcp-config --mcp-config "$CASES/$sha/.mcp.json")
+  set +e
   if [ "$auto" = 1 ]; then
-    exec claude "Analyze this case end to end: run the triage skill, then the deep-analysis skill, extract any config, write detections, and finish with the report skill. Work autonomously; only stop to ask me if you are blocked." "${extra[@]}" "${mcp[@]}"
+    claude "Analyze this case end to end. First list the samples and call lab.analysis_plan on the original with phase=full. Resume only checkpoint.remaining_ready_steps, follow them in order, defer steps that still need a procedure or feature, and do not rerun completed or recorded-gap steps unless the evidence changed. Do not run tools the plan skipped. Normalize every planned result, including success, with lab.normalize_analysis_result and its plan_id; include structured findings, record every visible gap, try the listed fallback, and continue independent work. If Detect-It-Easy materially changes the packing verdict, regenerate the plan with the appropriate packing_state override. Run the triage skill, then the applicable unpacking and deep-analysis work, extract any config, write detections, link report and annotation claims to retained evidence, audit them, and finish with the report skill. Work autonomously; only stop to ask me if you are blocked." "${extra[@]}" "${mcp[@]}"
+    rc=$?
+  else
+    claude "${extra[@]}" "${mcp[@]}"
+    rc=$?
   fi
-  exec claude "${extra[@]}" "${mcp[@]}"
+  set -e
+  stamp_report_profile "$sha" "$profile"
+  return "$rc"
 }
 
 cmd_stop()  { local sha; sha=$(resolve "${1:-}"); docker stop "$(cname "$sha")" >/dev/null && info "stopped"; }
 cmd_shell() { local sha; sha=$(resolve "${1:-}"); container_running "$(cname "$sha")" || start_sandbox "$sha" 0; exec docker exec -it -w /work "$(cname "$sha")" bash; }
+
+cmd_diagnose() {
+  local sha c v dir state reason
+  sha=$(resolve "${1:-}")
+  c=$(cname "$sha"); v=$(vname "$sha"); dir="$CASES/$sha"
+  echo "case: ${sha:0:12}"
+  echo "case directory: $dir (retained on host)"
+  echo "diagnostic only: no case container, volume, sample, project, or evidence will be removed"
+
+  if docker inspect "$c" >/dev/null 2>&1; then
+    if container_running "$c"; then state=running; else state=stopped; fi
+    echo "sandbox: $state ($c)"
+    if docker image inspect "$IMAGE" >/dev/null 2>&1; then
+      reason=$(container_recreation_reason "$c" "$sha" "$v" 0)
+      if [ -n "$reason" ]; then
+        echo "sandbox action: blackwall start ${sha:0:12} will recreate the container ($reason) and retain volume $v"
+      fi
+    fi
+  else
+    state=missing
+    echo "sandbox: missing; blackwall start ${sha:0:12} can recreate it"
+  fi
+
+  if ! docker volume inspect "$v" >/dev/null 2>&1; then
+    echo "analysis volume: missing ($v); the host case archive and notes remain in $dir"
+    return 0
+  fi
+  echo "analysis volume: present ($v)"
+  if [ "$state" = running ] && \
+      docker exec "$c" command -v bw-reliability >/dev/null 2>&1; then
+    docker exec "$c" bw-reliability --diagnose --work /work
+  elif docker image inspect "$IMAGE" >/dev/null 2>&1; then
+    docker run --rm --network none --cap-drop ALL --security-opt no-new-privileges \
+      --read-only --tmpfs /tmp:rw,nosuid,nodev,size=16m \
+      -v "$v":/work:ro "$IMAGE" bw-reliability --diagnose --work /work
+  else
+    echo "volume action: rebuild $IMAGE, then rerun this diagnostic; the volume was left untouched"
+  fi
+}
 
 cmd_rm() {
   local sha; sha=$(resolve "${1:-}")
@@ -295,12 +523,19 @@ cmd_rm() {
   fi
 }
 
-cmd="${1:-help}"; shift || true
-case "$cmd" in
-  setup) cmd_setup ;; doctor) cmd_doctor ;;
-  pull) cmd_pull "$@" ;; add) cmd_add "$@" ;; list|ls) cmd_list ;;
-  analyze|a) cmd_analyze "$@" ;; start) cmd_start "$@" ;; stop) cmd_stop "$@" ;;
-  shell|sh) cmd_shell "$@" ;; rm) cmd_rm "$@" ;;
-  help|-h|--help) usage ;;
-  *) usage; exit 1 ;;
-esac
+main() {
+  local cmd="${1:-help}"
+  shift || true
+  case "$cmd" in
+    setup) cmd_setup ;; doctor) cmd_doctor "$@" ;;
+    pull) cmd_pull "$@" ;; add) cmd_add "$@" ;; list|ls) cmd_list ;;
+    analyze|a) cmd_analyze "$@" ;; start) cmd_start "$@" ;; stop) cmd_stop "$@" ;;
+    shell|sh) cmd_shell "$@" ;; diagnose|diag) cmd_diagnose "$@" ;; rm) cmd_rm "$@" ;;
+    help|-h|--help) usage ;;
+    *) usage; return 1 ;;
+  esac
+}
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  main "$@"
+fi

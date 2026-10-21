@@ -15,7 +15,30 @@ import subprocess
 import sys
 import threading
 
-child = subprocess.Popen(sys.argv[1:], stdin=subprocess.PIPE, stdout=sys.stdout, stderr=sys.stderr)
+
+def duration(name, default):
+    try:
+        value = float(os.environ.get(name, default))
+    except ValueError:
+        return default
+    return min(max(value, 0.01), 300)
+
+
+child = subprocess.Popen(
+    sys.argv[1:],
+    stdin=subprocess.PIPE,
+    stdout=sys.stdout,
+    stderr=sys.stderr,
+    start_new_session=True,
+)
+
+
+def signal_group(signum):
+    if child.poll() is None:
+        try:
+            os.killpg(child.pid, signum)
+        except ProcessLookupError:
+            pass
 
 
 def pump():
@@ -34,9 +57,15 @@ def pump():
             child.stdin.close()
         except Exception:
             pass
-    for sig, wait in ((None, 5), (signal.SIGINT, 30), (signal.SIGTERM, 10), (signal.SIGKILL, 5)):
-        if sig is not None and child.poll() is None:
-            child.send_signal(sig)
+    waits = (
+        (None, duration("BW_STDIO_EOF_GRACE", 5)),
+        (signal.SIGINT, duration("BW_STDIO_INT_GRACE", 30)),
+        (signal.SIGTERM, duration("BW_STDIO_TERM_GRACE", 10)),
+        (signal.SIGKILL, duration("BW_STDIO_KILL_GRACE", 5)),
+    )
+    for sig, wait in waits:
+        if sig is not None:
+            signal_group(sig)
         try:
             child.wait(timeout=wait)
             return
@@ -45,8 +74,7 @@ def pump():
 
 
 def forward(signum, _frame):
-    if child.poll() is None:
-        child.send_signal(signum)
+    signal_group(signum)
 
 
 for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):

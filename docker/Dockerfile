@@ -125,6 +125,7 @@ RUN HOME=/opt/cache/home /opt/venv/bin/python -c \
 
 COPY rules /opt/blackwall/rules
 COPY lab /opt/blackwall/lab
+COPY benchmarks /opt/blackwall/benchmarks
 COPY docker/bin /opt/blackwall/bin
 RUN /opt/venv/bin/pip install --no-cache-dir --no-deps --no-build-isolation \
          /opt/blackwall/lab \
