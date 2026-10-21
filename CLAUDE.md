@@ -15,7 +15,10 @@ case folders (default `~/BlackWall-cases/<sha256>/`, outside this repo) with
   format router (`router.py`), durable evidence/checkpoint ledger
   (`evidence.py`), process and volume reliability checks (`reliability.py`),
   Ghidra readiness client (`ghidra_ready.py`), evaluation harness
-  (`benchmark.py`), the `intel` MCP server (`intel.py`), and the Speakeasy
+  (`benchmark.py`), the `intel` MCP server (`intel.py`), bounded ILSpy .NET
+  operations, isolated document/script (`documents.py`), archive/configuration
+  (`extractors.py`, `config_extractors.py`), native (`native.py`), case/report
+  (`casework.py`), and detection (`detections.py`) workers, and the Speakeasy
   runner (`emu_speakeasy.py`, which runs in a subprocess).
 - `analyst/`: the playbook copied into every case on `analyze` (CLAUDE.md,
   skills, permission settings).
@@ -28,9 +31,10 @@ case folders (default `~/BlackWall-cases/<sha256>/`, outside this repo) with
 
 ## Roadmap handoff
 
-P0 roadmap items 1–5 are complete. Continue with item 6, full .NET analysis,
-and preserve every P0 admission check while adding the new toolchain. See
-`docs/roadmap.md` for acceptance criteria and ordering.
+Roadmap items 1–12 and all field-validation follow-ups are complete. The only
+remaining roadmap work is the hardware-isolated dynamic-analysis plane.
+Preserve every existing admission check. See `docs/roadmap.md` for acceptance
+criteria.
 
 ## Invariants (don't break these)
 - Sample bytes never exist unzipped on the host. Anything that parses the
@@ -53,6 +57,24 @@ and preserve every P0 admission check while adding the new toolchain. See
   cancellation, and signal crash are distinct continuable evidence gaps.
   Diagnostics may identify scratch cleanup candidates but never remove retained
   state, samples, or the persistent Ghidra project.
+- Document and script analysis must stay interpreter-free. Preserve the worker
+  memory/time/output ceilings, archive and decoding budgets, generated output
+  names, and parent-process path/size/hash validation before lineage admission.
+- Android and native parity must remain static or explicitly emulated. Preserve
+  the pinned JADX bridge, isolated exact REA pwntools profile, Mach-O signature
+  verification disclaimer, Unicorn syscall boundary, and absence of untested
+  desktop/IL2CPP tools.
+- Recursive extraction is a globally bounded graph, not an unbounded loop.
+  Preserve generated output names, traversal/bomb controls, content
+  deduplication, parent validation, lineage, and deterministic rerouting.
+  Configuration extractors must remain statically registered reviewed code.
+- Case exports remain encrypted and manifest-verified; import must never unpack
+  the raw original on the host. Scratch cleanup must not touch state, samples,
+  rules, or Ghidra. Detection candidates require retained evidence and their
+  type-specific validation gate before export.
+- Releases require a verified signed version tag. Published image digests must
+  remain signed and attested, SBOM generation must cover image/Python/npm, and
+  automated dependency changes must stay inside the explicit allowlist.
 
 ## Dev loop
 - `docker build --build-arg UID=$(id -u) --build-arg GID=$(id -g) -t blackwall:latest -f docker/Dockerfile .`

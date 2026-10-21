@@ -1,7 +1,9 @@
 # Safe native-execution boundary
 
-Status: design only. BlackWall does not currently expose native sample
-execution. `lab.emulate_windows` is API emulation, not detonation.
+Status: **not implemented; design only (roadmap P2).** BlackWall's existing
+Docker analysis sandbox supports static analysis and bounded emulation, but it
+does not expose native sample execution. `lab.emulate_windows` is API
+emulation, not detonation.
 
 The completed static-workspace reliability controls—readiness probes, bounded
 parser process groups, stale-container recreation, and read-only diagnosis—do

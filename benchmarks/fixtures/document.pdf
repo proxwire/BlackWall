@@ -1,7 +1,7 @@
 %PDF-1.4
 % BlackWall inert benchmark fixture
 1 0 obj
-<< /Type /Catalog /Pages 2 0 R >>
+<< /Type /Catalog /Pages 2 0 R /OpenAction 6 0 R /Names << /EmbeddedFiles << /Names [(inert.txt) 7 0 R] >> >> >>
 endobj
 2 0 obj
 << /Type /Pages /Kids [3 0 R] /Count 1 >>
@@ -18,16 +18,39 @@ stream
 BT /F1 12 Tf 72 720 Td (BLACKWALL_INERT_PDF_FIXTURE https://pdf.fixture.invalid/api campaign=pdf-inert) Tj ET
 endstream
 endobj
+6 0 obj
+<< /Type /Action /S /JavaScript /JS 9 0 R >>
+endobj
+7 0 obj
+<< /Type /Filespec /F (inert.txt) /EF << /F 8 0 R >> >>
+endobj
+8 0 obj
+<< /Type /EmbeddedFile /Length 78 >>
+stream
+BLACKWALL_INERT_PDF_EMBEDDED_PAYLOAD
+https://pdf-embedded.fixture.invalid/api
+endstream
+endobj
+9 0 obj
+<< /S /JavaScript /Length 117 >>
+stream
+var endpoint = "https://pdf-script.fixture.invalid/api"; var command = "cmd.exe /c echo BLACKWALL_INERT_PDF_COMMAND";
+endstream
+endobj
 xref
-0 6
+0 10
 0000000000 65535 f 
 0000000045 00000 n 
-0000000094 00000 n 
-0000000151 00000 n 
-0000000277 00000 n 
-0000000347 00000 n 
+0000000173 00000 n 
+0000000230 00000 n 
+0000000356 00000 n 
+0000000426 00000 n 
+0000000586 00000 n 
+0000000646 00000 n 
+0000000717 00000 n 
+0000000864 00000 n 
 trailer
-<< /Size 6 /Root 1 0 R >>
+<< /Size 10 /Root 1 0 R >>
 startxref
-507
+1047
 %%EOF

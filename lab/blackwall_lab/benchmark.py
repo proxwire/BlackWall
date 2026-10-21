@@ -41,23 +41,61 @@ _CORE_COMMON = (
 )
 _CORE_BY_FORMAT = {
     "pe": ("lab.pe_info", "lab.floss", "lab.capa"),
-    "dotnet": ("lab.pe_info", "lab.dotnet_info"),
-    "elf": ("lab.elf_info", "lab.capa"),
-    "ooxml-word": ("lab.binwalk_scan",),
-    "rtf": ("lab.binwalk_scan",),
-    "pdf": ("lab.binwalk_scan",),
+    "dotnet": (
+        "lab.pe_info", "lab.dotnet_info", "lab.dotnet_inventory",
+        "lab.dotnet_list_resources",
+    ),
+    "elf": ("lab.elf_info", "lab.capa", "lab.emulate_elf"),
+    "elf-core": (),
+    "mach-o": ("lab.macho_info",),
+    # android_resources intentionally combines the raw extractor with REA's
+    # JADX-backed package evidence, so it belongs only in the hybrid lane.
+    "apk": (),
+    "zip": ("lab.recursive_unpack",),
+    "cab": ("lab.recursive_unpack",),
+    "blackwall-config": ("lab.config_extract",),
+    "javascript": ("lab.script_analyze", "lab.script_extract_payloads"),
+    "powershell": ("lab.script_analyze", "lab.script_extract_payloads"),
+    "vbscript": ("lab.script_analyze", "lab.script_extract_payloads"),
+    "vba": ("lab.script_analyze", "lab.script_extract_payloads"),
+    "ooxml-word": (
+        "lab.document_triage", "lab.document_vba", "lab.document_extract_artifacts",
+    ),
+    "ooxml-spreadsheet": (
+        "lab.document_triage", "lab.document_vba", "lab.document_extract_artifacts",
+    ),
+    "ooxml-presentation": (
+        "lab.document_triage", "lab.document_vba", "lab.document_extract_artifacts",
+    ),
+    "rtf": ("lab.document_triage", "lab.document_extract_artifacts"),
+    "pdf": ("lab.document_triage", "lab.document_extract_artifacts"),
 }
 _RUNNABLE_LAB_TOOLS = frozenset({
     "lab.binwalk_scan",
+    "lab.android_resources",
     "lab.capa",
+    "lab.dotnet_extract_resources",
     "lab.dotnet_info",
+    "lab.dotnet_inventory",
+    "lab.dotnet_list_resources",
+    "lab.document_extract_artifacts",
+    "lab.document_triage",
+    "lab.document_vba",
     "lab.elf_info",
+    "lab.emulate_elf",
     "lab.extract_iocs",
     "lab.file_overview",
     "lab.floss",
+    "lab.config_extract",
+    "lab.macho_info",
     "lab.pe_info",
     "lab.rea_managed_members",
+    "lab.rea_elf_layout",
+    "lab.rea_recorded_crash",
     "lab.rea_static_analysis",
+    "lab.script_analyze",
+    "lab.script_extract_payloads",
+    "lab.recursive_unpack",
     "lab.strings",
     "lab.upx_unpack",
     "lab.yara_scan",
@@ -207,9 +245,43 @@ def _core_steps(fixture: dict, timeout: int) -> list[dict]:
     steps = []
     for index, tool in enumerate(dict.fromkeys(tools)):
         arguments: dict[str, object] = {}
-        deadline = min(timeout, 30) if tool == "lab.binwalk_scan" else timeout
-        if tool in {"lab.capa", "lab.floss", "lab.binwalk_scan"}:
-            arguments["timeout"] = deadline
+        if tool == "lab.binwalk_scan":
+            deadline = min(timeout, 30)
+        elif tool == "lab.recursive_unpack":
+            deadline = min(timeout, 300)
+        elif tool in {"lab.script_analyze", "lab.script_extract_payloads"}:
+            deadline = min(timeout, 60)
+        elif tool in {"lab.document_triage", "lab.document_extract_artifacts"}:
+            deadline = min(timeout, 120)
+        elif tool == "lab.document_vba":
+            deadline = min(timeout, 180)
+        else:
+            deadline = timeout
+        if tool in {
+            "lab.capa", "lab.floss", "lab.binwalk_scan",
+            "lab.document_extract_artifacts", "lab.document_triage",
+            "lab.document_vba", "lab.script_analyze", "lab.script_extract_payloads",
+            "lab.android_resources", "lab.config_extract", "lab.emulate_elf",
+            "lab.macho_info", "lab.rea_elf_layout", "lab.rea_recorded_crash",
+        }:
+            timeout_cap = {
+                "lab.config_extract": 180,
+                "lab.emulate_elf": 120,
+                "lab.macho_info": 300,
+                "lab.rea_elf_layout": 600,
+                "lab.rea_recorded_crash": 600,
+                "lab.android_resources": 900,
+            }.get(tool, deadline)
+            arguments["timeout"] = min(deadline, timeout_cap)
+        if tool == "lab.recursive_unpack":
+            arguments["max_elapsed_seconds"] = deadline
+        if tool in {"lab.script_analyze", "lab.script_extract_payloads"}:
+            arguments["language"] = {
+                "javascript": "javascript",
+                "powershell": "powershell",
+                "vbscript": "vbscript",
+                "vba": "vba",
+            }.get(fmt, "unknown")
         steps.append(_step(
             f"core.{index:02d}.{tool.rsplit('.', 1)[-1]}",
             tool,
@@ -223,6 +295,12 @@ def _raw_rea_steps(fixture: dict, timeout: int) -> list[dict]:
     workflow = fixture["raw_rea"]["workflow"]
     if workflow == "native_overview":
         return [_step("raw-rea.native-overview", "lab.rea_native_overview", timeout, timeout=timeout)]
+    if workflow == "recorded_crash":
+        deadline = min(timeout, 600)
+        return [_step("raw-rea.recorded-crash", "lab.rea_recorded_crash", deadline, timeout=deadline)]
+    if workflow == "elf_layout":
+        deadline = min(timeout, 600)
+        return [_step("raw-rea.elf-layout", "lab.rea_elf_layout", deadline, timeout=deadline)]
     return [_step(
         f"raw-rea.{workflow}", "lab.rea_static_analysis", timeout,
         workflow=workflow, timeout=timeout,
@@ -600,6 +678,7 @@ def _environment(mode: str) -> dict:
             "capa": ["capa", "--version"],
             "floss": ["floss", "--version"],
             "upx": ["upx", "--version"],
+            "ilspy": ["/opt/blackwall/bin/bw-ilspy", "--version"],
             "rea": ["/opt/rea/runtime/node_modules/.bin/rea", "--version"],
         }
         environment["tools"] = {
@@ -767,14 +846,62 @@ def benchmark_self_check(manifest_path: Path) -> dict:
     result = run_benchmark(manifest_path, mode="plan")
     observed = {fixture["format"] for fixture in result["fixtures"]}
     required = {
-        "pe", "dotnet", "elf", "apk", "javascript", "wasm",
-        "ooxml-word", "rtf", "pdf", "pcap",
+        "pe", "dotnet", "elf", "apk", "javascript", "powershell",
+        "vbscript", "vba", "wasm", "ooxml-word", "ooxml-spreadsheet",
+        "rtf", "pdf", "pcap", "mach-o", "elf-core", "zip", "cab",
+        "blackwall-config",
     }
     missing = sorted(required - observed)
     if missing:
         raise BenchmarkError(f"inert corpus lacks required formats: {', '.join(missing)}")
     if not any("upx" in fixture["labels"] for fixture in result["fixtures"]):
         raise BenchmarkError("inert corpus lacks a packed PE fixture")
+    dotnet_shapes = {
+        label
+        for fixture in result["fixtures"] if fixture["format"] == "dotnet"
+        for label in fixture["labels"]
+    }
+    required_dotnet_shapes = {
+        "mixed-mode-marker", "obfuscated-identifiers", "embedded-resource",
+    }
+    missing_dotnet_shapes = sorted(required_dotnet_shapes - dotnet_shapes)
+    if missing_dotnet_shapes:
+        raise BenchmarkError(
+            "inert corpus lacks .NET fixture shapes: "
+            + ", ".join(missing_dotnet_shapes)
+        )
+    document_script_shapes = {
+        label
+        for fixture in result["fixtures"]
+        for label in fixture["labels"]
+    }
+    required_document_script_shapes = {
+        "safe-deobfuscation", "embedded-payload", "embedded-object",
+        "javascript-action", "vba-macro",
+    }
+    missing_document_script_shapes = sorted(
+        required_document_script_shapes - document_script_shapes
+    )
+    if missing_document_script_shapes:
+        raise BenchmarkError(
+            "inert corpus lacks document/script fixture shapes: "
+            + ", ".join(missing_document_script_shapes)
+        )
+    native_extraction_shapes = {
+        label for fixture in result["fixtures"] for label in fixture["labels"]
+    }
+    required_native_extraction_shapes = {
+        "objc", "swift", "code-signature", "recorded-core", "firmware",
+        "cpio", "installer", "family-extractor",
+    }
+    missing_native_extraction_shapes = sorted(
+        required_native_extraction_shapes - native_extraction_shapes
+    )
+    if missing_native_extraction_shapes:
+        raise BenchmarkError(
+            "inert corpus lacks native/extraction fixture shapes: "
+            + ", ".join(missing_native_extraction_shapes)
+        )
     return {
         "ok": True,
         "schema": RESULT_SCHEMA,

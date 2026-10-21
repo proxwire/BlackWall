@@ -1,0 +1,169 @@
+name: Signed release
+
+"on":
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  packages: write
+  id-token: write
+  attestations: write
+  artifact-metadata: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Require a GitHub-verified signed version tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]
+          project_version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' lab/pyproject.toml)
+          test "$GITHUB_REF_NAME" = "v$project_version"
+          tag_object=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$GITHUB_REF_NAME" --jq '.object')
+          test "$(jq -r .type <<<"$tag_object")" = tag
+          tag_sha=$(jq -r .sha <<<"$tag_object")
+          test "$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_sha" --jq '.verification.verified')" = true
+
+      - name: Run source admission checks
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends jq python3-venv shellcheck
+          python3 -m venv "${RUNNER_TEMP}/blackwall-release-checks"
+          "${RUNNER_TEMP}/blackwall-release-checks/bin/pip" install --disable-pip-version-check \
+            bandit==1.9.4 pip-audit==2.10.1 ruff==0.17.1 uv==0.12.21
+          export PATH="${RUNNER_TEMP}/blackwall-release-checks/bin:$PATH"
+          bash -n blackwall docker/bin/bw-ghidra-mcp docker/bin/bw-init \
+            docker/bin/bw-intel-mcp docker/bin/bw-lab-mcp docker/bin/bw-r2mcp \
+            docker/bin/bw-benchmark docker/bin/bw-ghidra-ready \
+            docker/bin/bw-ilspy docker/bin/bw-reliability tests/*.sh
+          shellcheck -e SC1091 blackwall docker/bin/bw-ghidra-mcp \
+            docker/bin/bw-init docker/bin/bw-intel-mcp docker/bin/bw-lab-mcp \
+            docker/bin/bw-r2mcp docker/bin/bw-benchmark docker/bin/bw-ghidra-ready \
+            docker/bin/bw-ilspy docker/bin/bw-reliability tests/*.sh
+          bash tests/test_profiles.sh
+          bash tests/test_case_management.sh
+          bash tests/test_reliability.sh
+          python3 -m compileall -q lab benchmarks scripts
+          python3 benchmarks/build_corpus.py --verify
+          python3 scripts/generate_sbom.py --self-check
+          python3 scripts/update_dependency.py --self-check
+          PYTHONPATH=lab python3 -m blackwall_lab.benchmark --self-check
+          ruff check --select F,I,B lab benchmarks scripts
+          bandit -q -r -lll lab/blackwall_lab scripts
+          uv pip compile lab/requirements.txt \
+            --python-version 3.12 \
+            --python-platform x86_64-unknown-linux-gnu \
+            --generate-hashes --no-emit-index-url \
+            --output-file lab/requirements.lock
+          uv pip compile rea-runtime/pwntools-requirements.txt \
+            --output-file rea-runtime/pwntools-requirements.lock \
+            --generate-hashes --python-version 3.12 \
+            --python-platform x86_64-manylinux_2_39 \
+            --custom-compile-command 'uv pip compile rea-runtime/pwntools-requirements.txt --output-file rea-runtime/pwntools-requirements.lock --generate-hashes --python-version 3.12 --python-platform x86_64-manylinux_2_39'
+          git diff --exit-code -- lab/requirements.lock rea-runtime/pwntools-requirements.lock
+          pip-audit -r lab/requirements.lock \
+            --ignore-vuln PYSEC-2026-311 \
+            --ignore-vuln PYSEC-2026-3813 \
+            --ignore-vuln PYSEC-2026-3814 \
+            --ignore-vuln PYSEC-2026-3815
+          pip-audit -r rea-runtime/pwntools-requirements.lock
+          python3 scripts/check_dependency_exceptions.py --online
+
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Build and test the release image
+        id: image
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          version="${GITHUB_REF_NAME#v}"
+          docker build --platform linux/amd64 --build-arg UID=1000 --build-arg GID=1000 \
+            -t "$image:$version" -t "$image:latest" -f docker/Dockerfile .
+          docker run --rm --network none -e HOME=/tmp "$image:$version" \
+            python -m unittest discover -v -s /opt/blackwall/lab/tests
+          docker run --rm --network none "$image:$version" \
+            bw-lab-mcp --profile strict --check-profile
+          docker run --rm --network none "$image:$version" \
+            bw-lab-mcp --profile expert --check-profile
+          docker run --rm --network none "$image:$version" bw-benchmark --self-check
+          docker run --rm --network none "$image:$version" \
+            bw-benchmark --mode plan --output /tmp/inert-plan
+          docker run --rm --network none "$image:$version" \
+            python -m blackwall_lab.extractors self-check
+          docker run --rm --network none "$image:$version" python -m pip check
+          docker run --rm "$image:$version" \
+            npm audit --prefix /opt/rea/runtime --omit=dev
+          bash tests/test_image_reliability.sh "$image:$version"
+          mkdir -p dist/sbom
+          python3 scripts/generate_sbom.py --output-dir dist/sbom --image "$image:$version"
+          python3 scripts/generate_sbom.py --verify dist/sbom/*.json
+          docker push "$image:$version" 2>&1 | tee /tmp/blackwall-push.txt
+          docker push "$image:latest"
+          digest=$(sed -n 's/^.*digest: \(sha256:[0-9a-f]\{64\}\).*$/\1/p' /tmp/blackwall-push.txt | tail -1)
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          echo "name=$image" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          sha256sum dist/sbom/*.json > dist/SHA256SUMS
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Sign the published image with GitHub OIDC
+        env:
+          IMAGE: ${{ steps.image.outputs.name }}
+          DIGEST: ${{ steps.image.outputs.digest }}
+        run: cosign sign --yes "$IMAGE@$DIGEST"
+
+      - name: Attest build provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-name: ${{ steps.image.outputs.name }}
+          subject-digest: ${{ steps.image.outputs.digest }}
+          push-to-registry: true
+
+      - name: Attest image SBOM
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-name: ${{ steps.image.outputs.name }}
+          subject-digest: ${{ steps.image.outputs.digest }}
+          sbom-path: dist/sbom/blackwall-image.cdx.json
+          push-to-registry: true
+
+      - name: Retain release metadata
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: blackwall-${{ steps.image.outputs.version }}-supply-chain
+          path: |
+            dist/sbom/*.json
+            dist/SHA256SUMS
+          if-no-files-found: error
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/sbom/*.json dist/SHA256SUMS --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/sbom/*.json dist/SHA256SUMS \
+              --verify-tag --generate-notes --title "BlackWall $GITHUB_REF_NAME"
+          fi

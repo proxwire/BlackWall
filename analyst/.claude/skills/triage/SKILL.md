@@ -24,16 +24,29 @@ Goal: within about 15 tool calls, know what you're holding and plan the deep div
    reason to silently switch formats.
 3. Follow the format route rather than running every engine:
    - Native PE/ELF/Mach-O stays in BlackWall's persistent Ghidra workspace.
-     Use capa addresses or Ghidra findings to satisfy deferred
+     Also retain the ready REA ELF-layout or `macho_info` metadata step selected
+     by the plan; a supplied ELF core takes the recorded-crash route and is not
+     imported as an executable. Use capa addresses or Ghidra findings to satisfy deferred
      `rea_native_function`, `rea_native_trace`, or `rea_native_value_flow`
      inputs. A broad REA native overview is intentionally skipped unless the
      image is unusual or evidence conflicts.
-   - Managed PE, APK, JavaScript/Electron, WASM, EVM, packet/web captures, and
-     SQLite use the focused REA operation and explicit format/encoding selected
-     by the plan.
-   - Documents, archives, scripts without a focused workflow, firmware, and
-     unknown data stay on conservative metadata, strings, IOC, signature, and
-     embedded-content steps. Unsupported format is a coverage gap, not proof
+   - Managed PE uses the bounded dnfile/ILSpy inventory and resource steps,
+     followed by token-selected C# and call analysis plus independent REA
+     managed workflows. A mixed-mode verdict additionally keeps Ghidra for the
+     native half. APK starts with bounded JADX-backed resources/package evidence
+     and defers focused Java/Kotlin source until a class or method is selected.
+     Packaged JavaScript/Electron, WASM, EVM, packet/web captures, and SQLite
+     use the focused REA operation and explicit format/encoding selected by the
+     plan.
+   - Office/OLE/OOXML/RTF/PDF routes use `document_triage`, optional
+     `document_vba`, and `document_extract_artifacts`. JavaScript/JScript,
+     VBScript, VBA source, and PowerShell use `script_analyze` and
+     `script_extract_payloads`; these are static and do not invoke native
+     interpreters. Use `recursive_unpack` for supported archive, CAB, UPX,
+     U-Boot uImage, and newc CPIO layers; it registers and reroutes every child
+     under global graph budgets. Route individually extracted children only
+     from their returned lineage. Unknown data stays on conservative metadata/
+     signature steps. Unsupported format is a coverage gap, not proof
      that a file is malformed or benign.
    - Never invoke REA's raw CLI. Use only the allowlisted `lab.rea_*` tools.
 4. After every planned call—including success—call

@@ -8,7 +8,12 @@
 set -euo pipefail
 
 BW_ROOT="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
-[ -f "$BW_ROOT/.env" ] && { set -a; . "$BW_ROOT/.env"; set +a; }
+if [ "${BLACKWALL_SKIP_ENV:-0}" != 1 ] && [ -f "$BW_ROOT/.env" ]; then
+  set -a
+  # shellcheck source=/dev/null
+  . "$BW_ROOT/.env"
+  set +a
+fi
 
 IMAGE="${BLACKWALL_IMAGE:-blackwall:latest}"
 CASES="${BLACKWALL_CASES:-$HOME/BlackWall-cases}"
@@ -35,6 +40,17 @@ usage: blackwall <command> [args]
   pull <sha256>            fetch a sample from MalwareBazaar (needs ABUSECH_API_KEY)
   add <file>               add a local sample (zipped with password '$ZIP_PW')
   list                     list cases
+  status <id> [--json]     show checkpoint progress and live resource usage
+  resume <id> [analyze options]
+                           resume pending checkpoint work with --auto
+  cancel <id>              stop an active run while preserving all case state
+  report <id> [--plan-id <id>]
+                           rebuild deterministic JSON + Markdown evidence reports
+  compare <left> <right> [--left-plan <id>] [--right-plan <id>]
+                           compare artifacts, code, strings, IOCs, config, detections
+  archive <id> [output]    stop and export an encrypted, manifested .7z bundle
+  import <bundle>          validate and restore an encrypted case bundle
+  clean <id> --scratch     remove only regenerable scratch/tmp data
   analyze <id> [--gui] [--auto] [--profile strict|expert] [-- <claude args>]
                            start the sandbox and launch Claude Code in the case
                              --gui   also open Ghidra's GUI (X11) driven by the same MCP session
@@ -50,6 +66,7 @@ usage: blackwall <command> [args]
 
 <id> is any unique prefix of the sample's sha256.
 Cases live in: $CASES
+Portable bundles use BLACKWALL_BUNDLE_PASSWORD, or '$ZIP_PW' when unset.
 EOF
 }
 
@@ -106,6 +123,23 @@ record_case_profile() {  # sha profile
     ' "$path" > "$tmp"; then
     rm -f "$tmp"
     die "could not update case profile metadata"
+  fi
+  mv "$tmp" "$path"
+}
+
+record_case_event() {  # sha event
+  local sha=$1 event=$2 path tmp occurred_at
+  path="$CASES/$sha/case.json"
+  [ -f "$path" ] || die "case metadata missing: $path"
+  occurred_at=$(date -u +%FT%TZ)
+  tmp=$(mktemp "$CASES/$sha/.case.json.XXXXXX")
+  if ! jq --arg event "$event" --arg occurred_at "$occurred_at" '
+      .lifecycle = ((.lifecycle // []) + [{event:$event, occurred_at:$occurred_at}]
+        | if length > 100 then .[-100:] else . end)
+      | .last_lifecycle_event = {event:$event, occurred_at:$occurred_at}
+    ' "$path" > "$tmp"; then
+    rm -f "$tmp"
+    die "could not update case lifecycle metadata"
   fi
   mv "$tmp" "$path"
 }
@@ -321,9 +355,12 @@ cmd_doctor() {
     check "failure supervision"       "docker run --rm --network none $IMAGE bw-reliability --self-check" "timeout, cancellation, crash, or cleanup preservation failed"
     check "radare2 + r2mcp (expert)"  "docker run --rm $IMAGE sh -c 'r2 -v && command -v r2mcp'" "rebuild"
     check "capa / floss / diec / upx" "docker run --rm $IMAGE sh -c 'capa --version && floss --version && command -v diec upx'" "rebuild"
+    check ".NET / ILSpy static lane" "docker run --rm --network none $IMAGE sh -c 'test \"\$(bw-ilspy --version | sed -n \"1s/^ilspycmd: //p\")\" = 11.1.0.9782 && /opt/dotnet/dotnet --list-runtimes | grep -q \"^Microsoft.NETCore.App 10\\.0\\.13 \"'" "rebuild"
+    check "document / script lane" "docker run --rm --network none $IMAGE sh -c 'test \"\$(python -c '\''from importlib.metadata import version; print(version(\"oletools\"))'\'')\" = 0.60.2 && olevba --help >/dev/null && python -m blackwall_lab.documents --help >/dev/null'" "rebuild"
     check "REA static lane"          "docker run --rm --network none $IMAGE sh -c '/opt/rea/runtime/node_modules/.bin/rea inspect-go-binary /bin/true --format json | jq -e . >/dev/null'" "rebuild"
     check "REA safety profile"       "docker run --rm $IMAGE sh -c 'test \"\$(/opt/rea/runtime/node_modules/.bin/rea --version)\" = 6.7.0 && test -r \"\$REA_JADX_MCP_JAR\" && test ! -d /opt/rea/runtime/node_modules/frida && ! command -v rea && command -v ps'" "rebuild"
     check "REA command manifest"      "docker run --rm $IMAGE python -c 'from blackwall_lab.server import _validate_rea_command_manifest as validate; validate()'" "rebuild"
+    check "REA pwntools profile"       "docker run --rm --network none $IMAGE sh -c '\$REA_PWNTOOLS_PYTHON -c \"from importlib.metadata import version; assert version(\\\"pwntools\\\") == \\\"4.15.0\\\"; assert version(\\\"pyelftools\\\") == \\\"0.33\\\"; assert version(\\\"unicorn\\\") == \\\"2.1.2\\\"\" && /opt/rea/runtime/node_modules/.bin/rea inspect-binary-layout /bin/true --format json | jq -e . >/dev/null'" "rebuild"
     check "format-aware router"       "docker run --rm --network none $IMAGE bw-lab-mcp --check-router" "router admission self-check failed"
     check "evidence + resume ledger"  "docker run --rm --network none $IMAGE bw-lab-mcp --check-evidence" "evidence lineage, deduplication, resume, or audit self-check failed"
     check "benchmark corpus + harness" "docker run --rm --network none $IMAGE bw-benchmark --self-check" "inert corpus integrity or benchmark admission failed"
@@ -332,6 +369,8 @@ cmd_doctor() {
       check "expert lab tool profile" "docker run --rm --network none $IMAGE bw-lab-mcp --profile expert --check-profile" "expert opt-in tools are unavailable"
     fi
     check "REA static providers"      "docker run --rm $IMAGE sh -c 'test \"\$(\$REA_WABT_BIN_DIRECTORY/wasm-validate --version)\" = 1.0.42 && tshark --version | head -1 | grep -q \"^TShark (Wireshark) 4\\.\" && capinfos --version | head -1 | grep -q \"^Capinfos (Wireshark) 4\\.\" && /opt/rea/runtime/node_modules/.bin/rea inspect-with-objdump /bin/true file_headers --format json | jq -e . >/dev/null'" "rebuild"
+    check "native/extraction workers" "docker run --rm --network none $IMAGE sh -c 'python -m blackwall_lab.native macho /opt/blackwall/benchmarks/fixtures/native-macho.macho | jq -e \".objective_c.present and .swift.present and .code_signature.present\" >/dev/null && python -m blackwall_lab.extractors self-check | jq -e .ok >/dev/null'" "rebuild"
+    check "case/report worker"       "docker run --rm --network none $IMAGE python -m blackwall_lab.casework --help" "rebuild"
     check "lab MCP server imports"    "docker run --rm -e HOME=/tmp $IMAGE python -c 'import blackwall_lab.server, blackwall_lab.intel'" "rebuild"
     check "lab regression tests"      "docker run --rm -e HOME=/tmp $IMAGE python -m unittest discover -s /opt/blackwall/lab/tests" "rebuild"
   fi
@@ -402,6 +441,228 @@ cmd_list() {
     [ -f "$d/report.md" ] && rep=yes || rep=-
     printf '%-14s %-10s %-28.28s %-8s %-8s %s\n' "${sha:0:12}" "$src" "$name" "$profile" "$state" "$rep"
   done
+}
+
+casework_readonly() {  # sha command [args...]
+  local sha=$1; shift
+  local volume dir
+  volume=$(vname "$sha"); dir="$CASES/$sha"
+  need_image
+  docker volume inspect "$volume" >/dev/null 2>&1 \
+    || die "analysis volume is missing for ${sha:0:12}"
+  docker run --rm --network none --cap-drop ALL \
+    --security-opt no-new-privileges --read-only \
+    --tmpfs /tmp:rw,nosuid,nodev,size=1g \
+    -v "$volume":/work:ro -v "$dir":/case:ro \
+    "$IMAGE" python -m blackwall_lab.casework "$@"
+}
+
+cmd_status() {
+  local sha json_mode=0 c v state analysis resources result
+  sha=$(resolve "${1:-}"); shift || true
+  [ "${1:-}" = "--json" ] && { json_mode=1; shift; }
+  [ $# -eq 0 ] || die "unknown status option: $1"
+  c=$(cname "$sha"); v=$(vname "$sha")
+  if container_running "$c"; then
+    state=running
+    resources=$(docker stats --no-stream --format '{{json .}}' "$c" 2>/dev/null || echo null)
+  elif docker inspect "$c" >/dev/null 2>&1; then
+    state=stopped; resources=null
+  else
+    state=missing; resources=null
+  fi
+  if docker volume inspect "$v" >/dev/null 2>&1; then
+    analysis=$(casework_readonly "$sha" status /work)
+  else
+    analysis=null
+  fi
+  result=$(jq -n \
+    --slurpfile metadata "$CASES/$sha/case.json" \
+    --arg sandbox "$state" --arg volume "$v" \
+    --argjson analysis "$analysis" --argjson resources "$resources" \
+    '{schema:"blackwall.host-case-status.v1", case:$metadata[0],
+      sandbox:{state:$sandbox, volume:$volume, resources:$resources},
+      analysis:$analysis}')
+  if [ "$json_mode" = 1 ]; then
+    jq . <<<"$result"
+  else
+    jq -r '
+      "case: \(.case.sha256[0:12])  \(.case.original_name // "unknown")",
+      "sandbox: \(.sandbox.state)  volume: \(.sandbox.volume)",
+      (if .sandbox.resources then
+        "resources: CPU \(.sandbox.resources.CPUPerc // "?")  memory \(.sandbox.resources.MemUsage // "?")  PIDs \(.sandbox.resources.PIDs // "?")"
+       else "resources: not running" end),
+      (if .analysis then
+        "progress: \(.analysis.progress.finished_steps)/\(.analysis.progress.total_steps) steps (\(.analysis.progress.percent)%)",
+        "evidence: \(.analysis.counts.evidence_records) records, \(.analysis.counts.derived_artifacts) derived artifacts, \(.analysis.counts.claims) claims",
+        (.analysis.checkpoints[]? |
+          "run \(.plan_id): \(.completed_steps|length) completed, \(.recorded_gap_steps|length) gaps, \(.redundant_steps|length) redundant, \(.remaining_ready_steps|length) pending, \(.deferred_steps|length) deferred")
+       else "analysis volume: missing" end)
+    ' <<<"$result"
+  fi
+}
+
+cmd_resume() {
+  local prefix="${1:-}"
+  [ -n "$prefix" ] || die "missing case id"
+  shift || true
+  cmd_analyze "$prefix" --auto "$@"
+}
+
+cmd_cancel() {
+  local sha c
+  sha=$(resolve "${1:-}"); c=$(cname "$sha")
+  if container_running "$c"; then
+    docker stop "$c" >/dev/null
+    record_case_event "$sha" cancelled
+    info "cancelled active analysis; checkpoint, evidence, and volume were preserved"
+  else
+    info "no active analysis for ${sha:0:12}; retained state was unchanged"
+  fi
+}
+
+cmd_report() {
+  local sha plan_id=''
+  local -a args bundle_env=()
+  sha=$(resolve "${1:-}"); shift || true
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --plan-id)
+        [ $# -ge 2 ] || die "--plan-id needs a 16-character plan id"
+        plan_id=$2; shift ;;
+      *) die "unknown report option: $1" ;;
+    esac
+    shift
+  done
+  need_image
+  docker volume inspect "$(vname "$sha")" >/dev/null 2>&1 \
+    || die "analysis volume is missing for ${sha:0:12}"
+  args=(report /work --case /case \
+    --json-out /case/evidence-report.json \
+    --markdown-out /case/evidence-report.md)
+  [ -n "$plan_id" ] && args+=(--plan-id "$plan_id")
+  [ -n "${BLACKWALL_BUNDLE_PASSWORD:-}" ] \
+    && bundle_env=(-e "BLACKWALL_BUNDLE_PASSWORD=$BLACKWALL_BUNDLE_PASSWORD")
+  docker run --rm --network none --cap-drop ALL \
+    --security-opt no-new-privileges --read-only \
+    --tmpfs /tmp:rw,nosuid,nodev,size=1g \
+    -v "$(vname "$sha")":/work:ro -v "$CASES/$sha":/case \
+    "${bundle_env[@]}" "$IMAGE" python -m blackwall_lab.casework "${args[@]}" \
+    | jq .
+  info "wrote $CASES/$sha/evidence-report.json and evidence-report.md"
+}
+
+cmd_compare() {
+  local left right left_plan='' right_plan=''
+  local -a args
+  left=$(resolve "${1:-}"); right=$(resolve "${2:-}"); shift 2 || true
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --left-plan) [ $# -ge 2 ] || die "--left-plan needs an id"; left_plan=$2; shift ;;
+      --right-plan) [ $# -ge 2 ] || die "--right-plan needs an id"; right_plan=$2; shift ;;
+      *) die "unknown compare option: $1" ;;
+    esac
+    shift
+  done
+  need_image
+  docker volume inspect "$(vname "$left")" >/dev/null 2>&1 \
+    || die "left analysis volume is missing"
+  docker volume inspect "$(vname "$right")" >/dev/null 2>&1 \
+    || die "right analysis volume is missing"
+  args=(compare /left /right --left-case /left-case --right-case /right-case)
+  [ -n "$left_plan" ] && args+=(--left-plan "$left_plan")
+  [ -n "$right_plan" ] && args+=(--right-plan "$right_plan")
+  docker run --rm --network none --cap-drop ALL \
+    --security-opt no-new-privileges --read-only \
+    --tmpfs /tmp:rw,nosuid,nodev,size=1g \
+    -v "$(vname "$left")":/left:ro -v "$(vname "$right")":/right:ro \
+    -v "$CASES/$left":/left-case:ro -v "$CASES/$right":/right-case:ro \
+    "$IMAGE" python -m blackwall_lab.casework "${args[@]}" | jq .
+}
+
+cmd_archive() {
+  local sha output output_dir output_name c bundle_env=()
+  sha=$(resolve "${1:-}"); shift || true
+  output="${1:-$CASES/$sha/exports/blackwall-${sha:0:12}.bwcase.7z}"
+  [ $# -le 1 ] || die "archive accepts only an optional output path"
+  output=$(readlink -m "$output")
+  output_dir=$(dirname "$output"); output_name=$(basename "$output")
+  mkdir -p "$output_dir"
+  [ ! -e "$output" ] || die "refusing to overwrite: $output"
+  c=$(cname "$sha")
+  if container_running "$c"; then
+    docker stop "$c" >/dev/null
+    info "stopped active sandbox for a consistent archive snapshot"
+  fi
+  record_case_event "$sha" archived
+  cmd_report "$sha" >/dev/null
+  [ -n "${BLACKWALL_BUNDLE_PASSWORD:-}" ] \
+    && bundle_env=(-e "BLACKWALL_BUNDLE_PASSWORD=$BLACKWALL_BUNDLE_PASSWORD")
+  [ -n "${BLACKWALL_BUNDLE_PASSWORD:-}" ] \
+    || warn "using default portable-bundle password '$ZIP_PW'; set BLACKWALL_BUNDLE_PASSWORD for a private password"
+  docker run --rm --network none --cap-drop ALL \
+    --security-opt no-new-privileges --read-only \
+    --tmpfs /tmp:rw,nosuid,nodev,size=1g \
+    -v "$(vname "$sha")":/work:ro -v "$CASES/$sha":/case:ro \
+    -v "$output_dir":/bundle-out \
+    "${bundle_env[@]}" "$IMAGE" python -m blackwall_lab.casework \
+    bundle /work /case "/bundle-out/$output_name" | jq .
+  info "encrypted case bundle: $output"
+}
+
+cmd_import() {
+  local bundle sha dir volume bundle_env=() inspect_result
+  bundle="${1:-}"
+  [ -f "$bundle" ] || die "no such bundle: $bundle"
+  bundle=$(readlink -f "$bundle")
+  need_image
+  [ -n "${BLACKWALL_BUNDLE_PASSWORD:-}" ] \
+    && bundle_env=(-e "BLACKWALL_BUNDLE_PASSWORD=$BLACKWALL_BUNDLE_PASSWORD")
+  inspect_result=$(docker run --rm --network none --cap-drop ALL \
+    --security-opt no-new-privileges --read-only \
+    --tmpfs /tmp:rw,nosuid,nodev,size=1g \
+    -v "$bundle":/bundle/case.7z:ro "${bundle_env[@]}" \
+    "$IMAGE" python -m blackwall_lab.casework inspect-bundle /bundle/case.7z)
+  sha=$(jq -er '.case_sha256 | select(test("^[0-9a-f]{64}$"))' <<<"$inspect_result") \
+    || die "bundle did not contain a valid case identity"
+  dir="$CASES/$sha"; volume=$(vname "$sha")
+  [ ! -e "$dir" ] || die "case already exists: $dir"
+  ! docker volume inspect "$volume" >/dev/null 2>&1 \
+    || die "analysis volume already exists: $volume"
+  mkdir -p "$dir"
+  docker volume create "$volume" >/dev/null
+  if ! docker run --rm --network none --cap-drop ALL \
+      --security-opt no-new-privileges --read-only \
+      --tmpfs /tmp:rw,nosuid,nodev,size=1g \
+      -v "$bundle":/bundle/case.7z:ro -v "$volume":/work -v "$dir":/case \
+      "${bundle_env[@]}" "$IMAGE" python -m blackwall_lab.casework \
+      import-bundle /bundle/case.7z /work /case | jq .; then
+    docker volume rm "$volume" >/dev/null 2>&1 || true
+    rm -rf "$dir"
+    die "bundle import failed; newly created empty targets were removed"
+  fi
+  mkdir -p "$dir"/{notes,detections,exports}
+  sync_playbook "$sha"
+  record_case_event "$sha" imported
+  info "restored case ${sha:0:12}; raw sample bytes remain inside the analysis volume"
+}
+
+cmd_clean() {
+  local sha c
+  sha=$(resolve "${1:-}"); shift || true
+  [ "${1:-}" = "--scratch" ] && [ $# -eq 1 ] \
+    || die "safe cleanup requires exactly: blackwall clean <id> --scratch"
+  c=$(cname "$sha")
+  ! container_running "$c" \
+    || die "stop or cancel the active analysis before cleaning scratch data"
+  need_image
+  docker volume inspect "$(vname "$sha")" >/dev/null 2>&1 \
+    || die "analysis volume is missing for ${sha:0:12}"
+  docker run --rm --network none --cap-drop ALL \
+    --security-opt no-new-privileges --read-only \
+    --tmpfs /tmp:rw,nosuid,nodev,size=64m \
+    -v "$(vname "$sha")":/work "$IMAGE" \
+    python -m blackwall_lab.casework cleanup /work --scratch | jq .
 }
 
 cmd_start() {
@@ -529,6 +790,10 @@ main() {
   case "$cmd" in
     setup) cmd_setup ;; doctor) cmd_doctor "$@" ;;
     pull) cmd_pull "$@" ;; add) cmd_add "$@" ;; list|ls) cmd_list ;;
+    status|progress) cmd_status "$@" ;; resume) cmd_resume "$@" ;;
+    cancel) cmd_cancel "$@" ;; report) cmd_report "$@" ;;
+    compare) cmd_compare "$@" ;; archive) cmd_archive "$@" ;;
+    import) cmd_import "$@" ;; clean) cmd_clean "$@" ;;
     analyze|a) cmd_analyze "$@" ;; start) cmd_start "$@" ;; stop) cmd_stop "$@" ;;
     shell|sh) cmd_shell "$@" ;; diagnose|diag) cmd_diagnose "$@" ;; rm) cmd_rm "$@" ;;
     help|-h|--help) usage ;;

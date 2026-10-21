@@ -537,12 +537,18 @@ class EvidenceStore:
     def _step_state(step: dict) -> str:
         attempts = step.get("attempts", [])
         if attempts:
-            return "completed" if attempts[-1].get("status") == "success" else "recorded_gap"
+            status = attempts[-1].get("status")
+            if status == "success":
+                return "completed"
+            if status == "not_run_redundant":
+                return "not_run_redundant"
+            return "recorded_gap"
         return "deferred" if step.get("planned_state") == "deferred" else "pending"
 
     def _checkpoint_summary(self, checkpoint: dict, path: Path) -> dict:
         by_state: dict[str, list[str]] = {
-            "completed": [], "recorded_gap": [], "pending": [], "deferred": [],
+            "completed": [], "recorded_gap": [], "not_run_redundant": [],
+            "pending": [], "deferred": [],
         }
         step_evidence: dict[str, list[str]] = {}
         step_evidence_totals: dict[str, int] = {}
@@ -560,6 +566,7 @@ class EvidenceStore:
             "updated_at": checkpoint.get("updated_at"),
             "completed_steps": by_state["completed"],
             "recorded_gap_steps": by_state["recorded_gap"],
+            "redundant_steps": by_state["not_run_redundant"],
             "remaining_ready_steps": by_state["pending"],
             "deferred_steps": by_state["deferred"],
             "step_evidence": step_evidence,
@@ -573,6 +580,7 @@ class EvidenceStore:
     def annotate_plan(self, plan: dict, summary: dict) -> None:
         completed = set(summary["completed_steps"])
         gaps = set(summary["recorded_gap_steps"])
+        redundant = set(summary.get("redundant_steps", []))
         pending = set(summary["remaining_ready_steps"])
         for step in plan.get("selected", []):
             step_id = step["id"]
@@ -580,6 +588,8 @@ class EvidenceStore:
                 state = "completed"
             elif step_id in gaps:
                 state = "recorded_gap"
+            elif step_id in redundant:
+                state = "not_run_redundant"
             elif step_id in pending:
                 state = "pending"
             else:

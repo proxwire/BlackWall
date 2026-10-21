@@ -1,0 +1,32 @@
+{
+  "schema": "blackwall.dependency-update-policy.v1",
+  "ecosystems": {
+    "python": {
+      "allowlist": [
+        "capstone",
+        "dnfile",
+        "httpx",
+        "lief",
+        "mcp",
+        "mcp-proxy",
+        "oletools",
+        "pefile",
+        "ppdeep",
+        "pycryptodome",
+        "pyghidra-mcp",
+        "py-tlsh",
+        "setuptools",
+        "speakeasy-emulator",
+        "unicorn",
+        "yara-python"
+      ],
+      "inputs": ["lab/requirements.txt"],
+      "locks": ["lab/requirements.lock"]
+    },
+    "npm": {
+      "allowlist": ["rea-agents"],
+      "inputs": ["rea-runtime/package.json"],
+      "locks": ["rea-runtime/package-lock.json"]
+    }
+  }
+}

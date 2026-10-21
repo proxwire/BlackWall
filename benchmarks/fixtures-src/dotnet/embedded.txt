@@ -1,0 +1,3 @@
+BLACKWALL_INERT_DOTNET_RESOURCE_FIXTURE
+https://dotnet-resource.fixture.invalid/api
+campaign=dotnet-resource-inert

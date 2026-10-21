@@ -1,0 +1,12 @@
+#!/bin/sh
+set -eu
+
+# ILSpy parses the selected assembly as bytes; it must never be invoked through
+# `dotnet <sample>`. Keep update checks disabled in the networkless sandbox and
+# put a tool-local ceiling below the container's overall memory limit.
+DOTNET_ROOT=${DOTNET_ROOT:-/opt/dotnet}
+DOTNET_GCHeapHardLimit=${DOTNET_GCHeapHardLimit:-0x40000000}
+DOTNET_EnableDiagnostics=0
+export DOTNET_ROOT DOTNET_GCHeapHardLimit DOTNET_EnableDiagnostics
+
+exec "$DOTNET_ROOT/dotnet" /opt/ilspycmd/ilspycmd.dll --disable-updatecheck "$@"

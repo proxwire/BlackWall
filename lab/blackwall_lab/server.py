@@ -18,15 +18,28 @@ import re
 import sys
 import tempfile
 import time
-from collections import Counter
+from bisect import bisect_right
+from collections import Counter, defaultdict, deque
 from pathlib import Path
 from urllib.parse import urlsplit
 
 from mcp.server.fastmcp import FastMCP
 
+from .detections import (
+    ATTACK_BEHAVIORS,
+    generate_sigma,
+    generate_suricata,
+    generate_yara,
+    map_attack,
+)
 from .evidence import EvidenceStore, evidence_self_check
 from .reliability import run_bounded
-from .router import build_analysis_plan, normalize_result, router_self_check
+from .router import (
+    build_analysis_plan,
+    detect_format,
+    normalize_result,
+    router_self_check,
+)
 
 WORK = Path("/work")
 SAMPLES = WORK / "samples"
@@ -34,10 +47,32 @@ DERIVED = SAMPLES / "derived"
 OUT = WORK / "out"
 CASE = Path("/case")
 RULES = Path("/opt/blackwall/rules")
+BENCHMARK_FIXTURES = Path("/opt/blackwall/benchmarks/fixtures")
 MAX_RESULT = 40_000
 REA_BIN = os.environ.get(
     "BLACKWALL_REA_BIN", "/opt/rea/runtime/node_modules/.bin/rea",
 )
+ILSPY_BIN = os.environ.get("BLACKWALL_ILSPY_BIN", "/opt/blackwall/bin/bw-ilspy")
+ILSPY_VERSION = "11.1.0.9782"
+OLEVBA_BIN = os.environ.get("BLACKWALL_OLEVBA_BIN", "/opt/venv/bin/olevba")
+OLETOOLS_VERSION = "0.60.2"
+MAX_DOTNET_INPUT = 256 * 1024 * 1024
+MAX_ILSPY_OUTPUT = 16 * 1024 * 1024
+MAX_DOTNET_ROWS = 2_000
+MAX_DOTNET_RESULTS = 500
+MAX_DOCUMENT_INPUT = 128 * 1024 * 1024
+MAX_DOCUMENT_OUTPUT = 8 * 1024 * 1024
+MAX_SCRIPT_INPUT = 8 * 1024 * 1024
+MAX_NATIVE_INPUT = 256 * 1024 * 1024
+MAX_EXTRACTION_INPUT = 256 * 1024 * 1024
+MAX_EXTRACTION_OUTPUT = 8 * 1024 * 1024
+JADX_BRIDGE_VERSION = "0.7.1"
+JADX_ENGINE_VERSION = "1.5.6"
+DOCUMENT_FORMATS = frozenset({
+    "ooxml", "ooxml-word", "ooxml-spreadsheet", "ooxml-presentation",
+    "ole-compound", "rtf", "pdf",
+})
+SCRIPT_FORMATS = frozenset({"javascript", "powershell", "vbscript"})
 
 # Deliberately narrow. REA also ships process, debugger, Frida, ADB, browser,
 # and other runtime capabilities. Those are not exposed in this container: a
@@ -85,8 +120,14 @@ REA_REQUIRED_COMMANDS = frozenset(REA_STATIC_WORKFLOWS.values()) | {
     "search-android-classes",
     "inspect-android-class",
     "inspect-android-method",
+    "inspect-binary-layout",
+    "inspect-recorded-crash",
     "inspect-with-objdump",
 } | REA_NATIVE_COMMANDS
+REA_UNADVERTISED_OPTIONAL_COMMANDS = frozenset({
+    "inspect-desktop-application",
+    "inspect-il2cpp-metadata",
+})
 REA_RUNTIME_COMMANDS = frozenset({
     "capture-process",
     "debug-with-gdb",
@@ -104,15 +145,33 @@ DEFAULT_PROFILE = "strict"
 EXPERT_ONLY_TOOLS = frozenset({"run_python", "shell"})
 STRICT_TOOL_ALLOWLIST = frozenset({
     "analysis_plan",
+    "attack_behavior_catalog",
+    "attack_map_behavior",
+    "android_decompile",
+    "android_resources",
     "audit_evidence",
     "binwalk_scan",
     "capa",
     "carve_embedded",
+    "config_extract",
+    "config_extractors",
+    "dotnet_call_references",
+    "dotnet_decompile",
     "dotnet_extract_resources",
     "dotnet_info",
+    "dotnet_inventory",
+    "dotnet_list_resources",
+    "dotnet_search",
+    "document_extract_artifacts",
+    "document_triage",
+    "document_vba",
     "elf_info",
+    "emulate_elf",
     "emulate_windows",
     "evidence_status",
+    "generate_sigma_candidate",
+    "generate_suricata_candidate",
+    "generate_yara_candidate",
     "export_to_host",
     "extract_iocs",
     "extract_pe_resource",
@@ -121,11 +180,13 @@ STRICT_TOOL_ALLOWLIST = frozenset({
     "hexdump",
     "list_samples",
     "link_evidence_claim",
+    "macho_info",
     "normalize_analysis_result",
     "pe_info",
     "rea_android_class",
     "rea_android_method",
     "rea_android_search",
+    "rea_elf_layout",
     "rea_evm_interface",
     "rea_managed_members",
     "rea_native_function",
@@ -136,9 +197,13 @@ STRICT_TOOL_ALLOWLIST = frozenset({
     "rea_native_trace",
     "rea_native_value_flow",
     "rea_objdump",
+    "rea_recorded_crash",
     "rea_web_capture",
     "record_findings",
+    "recursive_unpack",
     "register_derived",
+    "script_analyze",
+    "script_extract_payloads",
     "strings",
     "upx_unpack",
     "yara_scan",
@@ -189,11 +254,15 @@ def _sample(path: str) -> Path:
     return p
 
 
-def _run(cmd: list[str] | str, timeout: int = 300, cwd: Path = WORK, shell: bool = False) -> dict:
+def _run(cmd: list[str] | str, timeout: int = 300, cwd: Path | None = None,
+         shell: bool = False, max_output_bytes: int | None = None) -> dict:
     # The expert MCP profile exposes an intentional analyst shell, but only
     # inside BlackWall's locked-down, networkless container. All other callers
     # pass argv lists.
-    return run_bounded(cmd, timeout=timeout, cwd=cwd, shell=shell)
+    return run_bounded(
+        cmd, timeout=timeout, cwd=cwd or WORK, shell=shell,
+        max_output_bytes=max_output_bytes,
+    )
 
 
 def _clip(text: str, limit: int = MAX_RESULT) -> str:
@@ -299,7 +368,16 @@ def _validate_rea_command_manifest() -> dict:
     missing = sorted(REA_REQUIRED_COMMANDS - available)
     if missing:
         raise RuntimeError(f"REA commands missing from installed release: {', '.join(missing)}")
-    return {"required": len(REA_REQUIRED_COMMANDS), "available": len(available)}
+    return {
+        "required": len(REA_REQUIRED_COMMANDS),
+        "available": len(available),
+        "unadvertised_optional_present": sorted(
+            REA_UNADVERTISED_OPTIONAL_COMMANDS & available
+        ),
+        "unadvertised_optional_absent": sorted(
+            REA_UNADVERTISED_OPTIONAL_COMMANDS - available
+        ),
+    }
 
 
 def _rea_run(path: Path, workflow: str, arguments: list[str], timeout: int) -> dict:
@@ -401,6 +479,14 @@ def _hashes(data: bytes) -> dict:
     except Exception:
         pass
     return out
+
+
+def _sha256_path(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _evidence_store() -> EvidenceStore:
@@ -523,9 +609,10 @@ def normalize_analysis_result(step_id: str, tool_name: str,
                               findings: list[dict] | None = None) -> dict:
     """Normalize and durably record one tool outcome.
 
-    Status is one of success, partial, unsupported, timeout, failed, or
-    skipped. Every state remains continuable so automation can try the plan's
-    fallback and independent steps instead of silently stopping. Pass the
+    Status is one of success, partial, unsupported, timeout, cancelled,
+    crashed, failed, skipped, or not_run_redundant. Every state remains
+    continuable so automation can try the plan's fallback and independent
+    steps instead of silently stopping. Pass the
     ``plan_id`` returned by analysis_plan to retain an immutable evidence
     record, advance its checkpoint, and optionally reconcile structured
     findings. For a listed fallback, pass its exact ``command_arguments``. For
@@ -647,6 +734,1196 @@ def file_overview(path: str) -> dict:
     }
 
 
+# --------------------------------------------------------------------------- bounded .NET / ILSpy helpers
+
+
+def _dotnet_target(path: str) -> Path:
+    target = _sample(path)
+    size = target.stat().st_size
+    if size > MAX_DOTNET_INPUT:
+        raise ValueError(
+            f".NET input exceeds the {MAX_DOTNET_INPUT}-byte parser limit: {size}"
+        )
+    return target
+
+
+def _bounded_page(offset: int, limit: int) -> tuple[int, int]:
+    if not 0 <= int(offset) <= 1_000_000:
+        raise ValueError("offset must be between 0 and 1000000")
+    if not 1 <= int(limit) <= MAX_DOTNET_RESULTS:
+        raise ValueError(f"limit must be between 1 and {MAX_DOTNET_RESULTS}")
+    return int(offset), int(limit)
+
+
+def _dotnet_text(value: str, label: str, max_length: int = 512) -> str:
+    if not isinstance(value, str) or not value or len(value) > max_length:
+        raise ValueError(f"invalid {label}")
+    if "\0" in value or any(ord(char) < 32 for char in value):
+        raise ValueError(f"invalid {label}")
+    return value
+
+
+def _dotnet_method_token(value: str) -> str:
+    value = _dotnet_text(value, "method token", 10)
+    if not re.fullmatch(r"0x06[0-9a-fA-F]{6}", value):
+        raise ValueError("method must be a MethodDef token such as 0x06000001")
+    return value.lower()
+
+
+def _ilspy_run(
+    path: Path,
+    arguments: list[str],
+    *,
+    timeout: int,
+    output_limit: int = MAX_ILSPY_OUTPUT,
+) -> tuple[dict, Path]:
+    """Run the pinned, static-only ILSpy frontend with hard input/output/time caps."""
+    timeout = max(10, min(int(timeout), 600))
+    run = _run(
+        [ILSPY_BIN, str(path), *arguments],
+        timeout=timeout,
+        max_output_bytes=output_limit,
+    )
+    identity = hashlib.sha256(json.dumps(
+        {"path": str(path), "arguments": arguments},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode()).hexdigest()[:16]
+    saved = _save(f"ilspy-{identity}.json", {
+        "schema": "blackwall.ilspy-run.v1",
+        "provider": {"name": "ILSpyCmd", "version": ILSPY_VERSION},
+        "target": str(path),
+        "arguments": arguments,
+        "limits": {
+            "input_bytes": MAX_DOTNET_INPUT,
+            "combined_output_bytes": output_limit,
+            "timeout_seconds": timeout,
+        },
+        **run,
+    })
+    return run, saved
+
+
+def _ilspy_failure(run: dict, saved: Path) -> dict | None:
+    if run.get("rc") == 0 and not run.get("timed_out") and not run.get("output_limited"):
+        return None
+    stderr = str(run.get("stderr") or "").strip()
+    stdout = str(run.get("stdout") or "")
+    return {
+        "provider": "ILSpyCmd",
+        "tool_version": ILSPY_VERSION,
+        "rc": run.get("rc"),
+        "timed_out": bool(run.get("timed_out")),
+        "cancelled": bool(run.get("cancelled")),
+        "crashed": bool(run.get("crashed")),
+        "termination_signal": run.get("termination_signal"),
+        "partial": bool(stdout),
+        "truncated": bool(run.get("output_limited")),
+        "output_truncated": bool(run.get("output_limited")),
+        "error": _clip(stderr or "ILSpyCmd failed without a diagnostic", 4000),
+        "output_preview": _clip(_redact_text(stdout)[0], 12_000),
+        "saved_to": str(saved),
+    }
+
+
+def _ilspy_table(path: Path, table: str, timeout: int) -> tuple[dict | None, dict | None]:
+    run, saved = _ilspy_run(
+        path,
+        ["--dump-table", table, "--json"],
+        timeout=timeout,
+        output_limit=4 * 1024 * 1024,
+    )
+    failure = _ilspy_failure(run, saved)
+    if failure is not None:
+        return None, failure
+    try:
+        document = json.loads(run["stdout"])
+    except (TypeError, json.JSONDecodeError) as exc:
+        return None, {
+            "provider": "ILSpyCmd", "tool_version": ILSPY_VERSION,
+            "rc": run.get("rc"), "error": f"invalid {table} JSON: {exc}",
+            "saved_to": str(saved),
+        }
+    rows = document.get("rows") if isinstance(document, dict) else None
+    if not isinstance(rows, list) or not isinstance(document.get("rowCount"), int):
+        return None, {
+            "provider": "ILSpyCmd", "tool_version": ILSPY_VERSION,
+            "rc": run.get("rc"), "error": f"invalid {table} table shape",
+            "saved_to": str(saved),
+        }
+    if len(rows) > 100_000:
+        return None, {
+            "provider": "ILSpyCmd", "tool_version": ILSPY_VERSION,
+            "rc": run.get("rc"), "error": f"{table} exceeds the 100000-row table limit",
+            "saved_to": str(saved),
+        }
+    return document, None
+
+
+def _row_integer(value: object) -> int | None:
+    if isinstance(value, int):
+        return value
+    if not isinstance(value, str) or value.lower() == "nil":
+        return None
+    try:
+        return int(value, 0)
+    except ValueError:
+        return int(value) if value.isdecimal() else None
+
+
+def _method_inventory(type_rows: list[dict], method_rows: list[dict]) -> list[dict]:
+    """Attach MethodDef rows to the TypeDef MethodList ranges from ECMA-335."""
+    ordered_types = sorted(type_rows, key=lambda row: _row_integer(row.get("RID")) or 0)
+    starts = []
+    previous = 1
+    for row in ordered_types:
+        # Valid ECMA-335 MethodList indexes are monotonic.  Keep malformed
+        # metadata monotonic too so hostile tables cannot turn attribution into
+        # an O(types * methods) scan or confuse bisect's ordering contract.
+        previous = max(previous, _row_integer(row.get("MethodList")) or previous)
+        starts.append(previous)
+    methods = []
+    for raw in method_rows:
+        row = dict(raw)
+        rid = _row_integer(row.get("RID")) or 0
+        owner = None
+        owner_index = bisect_right(starts, rid) - 1
+        if 0 <= owner_index < len(ordered_types):
+            type_row = ordered_types[owner_index]
+            namespace = str(type_row.get("Namespace") or "")
+            name = str(type_row.get("Name") or "")
+            owner = f"{namespace}.{name}" if namespace else name
+        row["DeclaringType"] = owner
+        methods.append(row)
+    return methods
+
+
+def _dotnet_characteristics(path: Path) -> dict:
+    import dnfile
+
+    pe = dnfile.dnPE(str(path))
+    if not getattr(pe, "net", None):
+        raise ValueError("not a .NET assembly")
+    flags = int(pe.net.struct.Flags)
+    names = [
+        name for bit, name in (
+            (0x00000001, "ILONLY"),
+            (0x00000002, "32BITREQUIRED"),
+            (0x00000004, "ILLIBRARY"),
+            (0x00000008, "STRONGNAMESIGNED"),
+            (0x00000010, "NATIVE_ENTRYPOINT"),
+            (0x00010000, "TRACKDEBUGDATA"),
+            (0x00020000, "32BITPREFERRED"),
+        ) if flags & bit
+    ]
+    return {
+        "corflags": f"0x{flags:08x}",
+        "corflags_names": names,
+        "il_only": bool(flags & 0x1),
+        "mixed_mode": not bool(flags & 0x1) or bool(flags & 0x10),
+    }
+
+
+def _obfuscation_indicators(types: list[dict], methods: list[dict]) -> list[dict]:
+    values = [
+        ("type", str(row.get("Name") or ""), row.get("Token")) for row in types
+    ] + [
+        ("method", str(row.get("Name") or ""), row.get("Token")) for row in methods
+    ]
+    indicators = []
+    for kind, name, token in values:
+        if not name or name in {"<Module>", ".ctor", ".cctor"}:
+            continue
+        reasons = []
+        if any(ord(char) > 127 for char in name):
+            reasons.append("non-ASCII identifier")
+        if len(name) <= 2 and name not in {"Main"}:
+            reasons.append("very short identifier")
+        if any(not (char.isalnum() or char in "_.$<>`") for char in name):
+            reasons.append("unusual identifier characters")
+        if reasons:
+            indicators.append({
+                "kind": kind, "name": _preview(name), "token": token,
+                "reasons": reasons,
+            })
+        if len(indicators) >= 100:
+            break
+    return indicators
+
+
+def _page_rows(rows: list[dict], query: str | None, offset: int, limit: int) -> dict:
+    if query is not None:
+        query = _dotnet_text(query, "query", 256)
+        needle = query.casefold()
+        filtered = [
+            row for row in rows
+            if needle in json.dumps(row, ensure_ascii=False, default=str).casefold()
+        ]
+    else:
+        filtered = rows
+    page = filtered[offset:offset + limit]
+    redacted, redactions = _redact_value(page)
+    return {
+        "total": len(rows), "matched": len(filtered), "offset": offset,
+        "limit": limit, "returned": len(page),
+        "truncated": offset + len(page) < len(filtered),
+        "items": redacted, "redactions": redactions,
+    }
+
+
+@tool()
+def dotnet_inventory(path: str, entity: str = "all", query: str | None = None,
+                     offset: int = 0, limit: int = 200,
+                     timeout: int = 180) -> dict:
+    """List a managed assembly, its references, types, and methods with tokens.
+
+    ``entity`` is all, assembly, types, or methods. Results use literal query
+    filtering plus pagination; complete bounded metadata is retained under
+    /work/out for evidence normalization. Mixed-mode flags and suspicious
+    identifier characteristics remain explicit.
+    """
+    if entity not in {"all", "assembly", "types", "methods"}:
+        raise ValueError("entity must be all, assembly, types, or methods")
+    offset, limit = _bounded_page(offset, limit)
+    target = _dotnet_target(path)
+    timeout = max(10, min(int(timeout), 300))
+    deadline = time.monotonic() + timeout
+    required = {
+        "assembly": ("Assembly", "Module", "AssemblyRef"),
+        "types": ("TypeDef",),
+        "methods": ("TypeDef", "MethodDef"),
+        "all": ("Assembly", "Module", "AssemblyRef", "TypeDef", "MethodDef"),
+    }[entity]
+    tables = {}
+    for table in required:
+        remaining = max(1, math.ceil(deadline - time.monotonic()))
+        document, failure = _ilspy_table(target, table, remaining)
+        if failure is not None:
+            failure["entity"] = entity
+            failure["failed_table"] = table
+            return failure
+        tables[table] = document
+
+    type_rows = list(tables.get("TypeDef", {}).get("rows", []))
+    method_rows = _method_inventory(
+        type_rows, list(tables.get("MethodDef", {}).get("rows", [])),
+    )
+    retained = {
+        "schema": "blackwall.dotnet-inventory.v1",
+        "provider": {"name": "ILSpyCmd", "version": ILSPY_VERSION},
+        "target": str(target), "entity": entity, "tables": tables,
+        "methods_with_declaring_types": method_rows,
+    }
+    identity = hashlib.sha256(
+        f"{target}:{entity}".encode(), usedforsecurity=True,
+    ).hexdigest()[:16]
+    saved = _save(f"dotnet-inventory-{identity}.json", retained)
+    result = {
+        "schema": retained["schema"], "provider": retained["provider"],
+        "target": str(target), "entity": entity,
+        "characteristics": _dotnet_characteristics(target),
+        "saved_to": str(saved),
+    }
+    if entity in {"all", "assembly"}:
+        result["assemblies"] = _page_rows(
+            list(tables.get("Assembly", {}).get("rows", [])), query, offset, limit,
+        )
+        result["modules"] = _page_rows(
+            list(tables.get("Module", {}).get("rows", [])), query, offset, limit,
+        )
+        result["references"] = _page_rows(
+            list(tables.get("AssemblyRef", {}).get("rows", [])), query, offset, limit,
+        )
+    if entity in {"all", "types"}:
+        result["types"] = _page_rows(type_rows, query, offset, limit)
+    if entity in {"all", "methods"}:
+        result["methods"] = _page_rows(method_rows, query, offset, limit)
+    if entity == "all":
+        result["obfuscation_indicators"] = _obfuscation_indicators(type_rows, method_rows)
+    return result
+
+
+@tool()
+def dotnet_decompile(path: str, method: str | None = None,
+                     type_name: str | None = None, timeout: int = 180) -> dict:
+    """Decompile exactly one MethodDef token or fully-qualified type to C#.
+
+    Selectors come from dotnet_inventory. The full bounded source is retained
+    under /work/out while the MCP response returns a redacted preview.
+    """
+    if (method is None) == (type_name is None):
+        raise ValueError("provide exactly one of method or type_name")
+    if method is not None:
+        selector = _dotnet_method_token(method)
+        arguments = ["--member", selector]
+        selector_kind = "method"
+    else:
+        selector = _dotnet_text(type_name or "", "type_name")
+        if selector.startswith("-"):
+            raise ValueError("invalid type_name")
+        arguments = ["--type", selector]
+        selector_kind = "type"
+    target = _dotnet_target(path)
+    run, saved = _ilspy_run(
+        target, arguments, timeout=timeout, output_limit=8 * 1024 * 1024,
+    )
+    failure = _ilspy_failure(run, saved)
+    if failure is not None:
+        failure.update({"selector_kind": selector_kind, "selector": selector})
+        return failure
+    source = run["stdout"]
+    preview, redactions = _redact_text(source)
+    return {
+        "provider": "ILSpyCmd", "tool_version": ILSPY_VERSION,
+        "target": str(target), "selector_kind": selector_kind,
+        "selector": selector, "language": "C#", "rc": 0,
+        "source_sha256": hashlib.sha256(source.encode()).hexdigest(),
+        "source_bytes": len(source.encode()),
+        "source_preview": _clip(preview, 30_000),
+        "output_truncated": len(preview) > 30_000,
+        "redactions": redactions, "saved_to": str(saved),
+    }
+
+
+_IL_METHOD_END = re.compile(
+    r"^\s*}\s*// end of method (?P<owner>.+?)::(?P<name>.+?)\s*$", re.MULTILINE,
+)
+_IL_METHOD_START = re.compile(r"^\s*\.method\b", re.MULTILINE)
+_IL_METHOD_RVA = re.compile(
+    r"^\s*// Method begins at RVA (?P<rva>0x[0-9a-fA-F]+)\s*$", re.MULTILINE,
+)
+_IL_CALL = re.compile(
+    r"^\s*(?P<offset>IL_[0-9a-fA-F]+):\s*"
+    r"(?P<opcode>call|callvirt|newobj|jmp|ldftn|ldvirtftn)\s+"
+    r"(?P<target>.+?)\s*$",
+    re.MULTILINE,
+)
+
+
+def _il_identifier(value: object) -> str:
+    """Normalize ILSpy's optional identifier quoting for metadata matching."""
+    text = str(value or "").strip()
+    text = re.sub(r"'([^']*)'", r"\1", text)
+    text = re.sub(r'"([^"]*)"', r"\1", text)
+    return text
+
+
+def _il_owner_aliases(value: object) -> tuple[str, ...]:
+    owner = _il_identifier(value)
+    short = owner.rsplit(".", 1)[-1]
+    return (owner,) if short == owner else (owner, short)
+
+
+def _parse_il_methods(il: str, method_rows: list[dict], max_methods: int) -> list[dict]:
+    starts = [match.start() for match in _IL_METHOD_START.finditer(il)]
+    blocks = []
+    used_rows: set[int] = set()
+    by_rva: defaultdict[int, deque[dict]] = defaultdict(deque)
+    by_owner_name: defaultdict[tuple[str, str], deque[dict]] = defaultdict(deque)
+    by_name: defaultdict[str, deque[dict]] = defaultdict(deque)
+    remaining_rows: deque[dict] = deque(method_rows)
+    for row in method_rows:
+        rva = _row_integer(row.get("RVA"))
+        if rva is not None:
+            by_rva[rva].append(row)
+        name = _il_identifier(row.get("Name"))
+        by_name[name].append(row)
+        for owner in _il_owner_aliases(row.get("DeclaringType")):
+            by_owner_name[(owner, name)].append(row)
+
+    def take(candidates: deque[dict]) -> dict | None:
+        while candidates:
+            candidate = candidates.popleft()
+            identity = id(candidate)
+            if identity not in used_rows:
+                used_rows.add(identity)
+                return candidate
+        return None
+
+    for end in _IL_METHOD_END.finditer(il):
+        start_index = bisect_right(starts, end.start()) - 1
+        if start_index < 0:
+            continue
+        start = starts[start_index]
+        body = il[start:end.end()]
+        name = _il_identifier(end.group("name"))
+        owner_aliases = _il_owner_aliases(end.group("owner"))
+        rva_match = _IL_METHOD_RVA.search(body)
+        metadata = take(by_rva[int(rva_match.group("rva"), 16)]) if rva_match else None
+        if metadata is None:
+            for owner in owner_aliases:
+                metadata = take(by_owner_name[(owner, name)])
+                if metadata is not None:
+                    break
+        if metadata is None:
+            metadata = take(by_name[name])
+        if metadata is None:
+            metadata = take(remaining_rows) or {}
+        token = str(metadata.get("Token") or "").lower() or None
+        calls = [match.groupdict() for match in _IL_CALL.finditer(body)]
+        blocks.append({
+            "token": token,
+            "declaring_type": metadata.get("DeclaringType") or _il_identifier(end.group("owner")),
+            "name": metadata.get("Name") or name,
+            "rva": metadata.get("RVA"),
+            "body": body,
+            "calls": calls,
+        })
+        if len(blocks) >= max_methods:
+            break
+    return blocks
+
+
+def _dotnet_il_index(path: Path, max_methods: int, timeout: int) -> tuple[dict | None, dict | None]:
+    if not 1 <= int(max_methods) <= MAX_DOTNET_ROWS:
+        raise ValueError(f"max_methods must be between 1 and {MAX_DOTNET_ROWS}")
+    timeout = max(10, min(int(timeout), 600))
+    deadline = time.monotonic() + timeout
+    type_table, failure = _ilspy_table(path, "TypeDef", timeout)
+    if failure is not None:
+        return None, failure
+    remaining = max(1, math.ceil(deadline - time.monotonic()))
+    method_table, failure = _ilspy_table(path, "MethodDef", remaining)
+    if failure is not None:
+        return None, failure
+    method_rows = _method_inventory(type_table["rows"], method_table["rows"])
+    remaining = max(1, math.ceil(deadline - time.monotonic()))
+    run, saved = _ilspy_run(path, ["--ilcode"], timeout=remaining)
+    failure = _ilspy_failure(run, saved)
+    if failure is not None:
+        return None, failure
+    blocks = _parse_il_methods(run["stdout"], method_rows, int(max_methods))
+    return {
+        "method_rows": method_rows,
+        "method_count": len(method_rows),
+        "indexed_count": len(blocks),
+        "index_truncated": len(method_rows) > len(blocks),
+        "methods": blocks,
+        "saved_to": str(saved),
+    }, None
+
+
+def _public_il_call(call: dict) -> dict:
+    target, redactions = _redact_text(str(call.get("target") or ""))
+    result = {
+        "offset": _preview(call.get("offset") or "", 32),
+        "opcode": _preview(call.get("opcode") or "", 32),
+        "target": _preview(target, 2_000),
+    }
+    if redactions:
+        result["redactions"] = redactions
+    return result
+
+
+def _public_il_identifier(value: object) -> str:
+    return _preview(_redact_text(str(value or ""))[0], 512)
+
+
+def _retain_dotnet_operation(
+    operation: str,
+    target: Path,
+    parameters: dict,
+    result: dict,
+) -> dict:
+    """Retain one bounded, processed .NET result alongside its raw IL input."""
+    identity = hashlib.sha256(json.dumps({
+        "target": str(target), "operation": operation, "parameters": parameters,
+    }, sort_keys=True, ensure_ascii=False, default=str).encode()).hexdigest()[:16]
+    saved = _save(f"dotnet-{operation}-{identity}.json", {
+        "schema": "blackwall.dotnet-operation.v1",
+        "operation": operation,
+        "target": str(target),
+        "parameters": parameters,
+        "result": result,
+    })
+    returned = dict(result)
+    returned["saved_to"] = str(saved)
+    return returned
+
+
+def _call_matches_method(call_target: str, method: dict) -> bool:
+    marker = f"::{method['name']}("
+    if marker not in call_target:
+        return False
+    owner = str(method.get("declaring_type") or "")
+    if not owner:
+        return True
+    before = call_target.split(marker, 1)[0].strip().split()[-1].strip("'\"")
+    before = re.sub(r"^\[[^]]+]", "", before)
+    return before == owner or before.endswith(f".{owner}") or owner.endswith(f".{before}")
+
+
+@tool()
+def dotnet_call_references(path: str, method: str, direction: str = "both",
+                           max_methods: int = 1000, limit: int = 200,
+                           timeout: int = 240) -> dict:
+    """Find bounded outgoing and/or incoming static IL call references.
+
+    ``method`` is an exact MethodDef token from dotnet_inventory; direction is
+    incoming, outgoing, or both. Indirect/reflection dispatch is reported as a
+    limitation rather than guessed.
+    """
+    token = _dotnet_method_token(method)
+    if direction not in {"incoming", "outgoing", "both"}:
+        raise ValueError("direction must be incoming, outgoing, or both")
+    _, limit = _bounded_page(0, limit)
+    target = _dotnet_target(path)
+    index, failure = _dotnet_il_index(target, max_methods, timeout)
+    if failure is not None:
+        failure.update({"method": token, "direction": direction})
+        return failure
+    selected = next((item for item in index["methods"] if item["token"] == token), None)
+    if selected is None:
+        known = any(str(row.get("Token", "")).lower() == token for row in index["method_rows"])
+        result = {
+            "provider": "ILSpyCmd", "tool_version": ILSPY_VERSION,
+            "method": token, "direction": direction, "partial": known,
+            "error": (
+                "method has no decoded IL body within the bounded index"
+                if known else "MethodDef token is not present in the assembly"
+            ),
+            "indexed_methods": index["indexed_count"],
+            "method_count": index["method_count"],
+            "raw_il_saved_to": index["saved_to"],
+        }
+        return _retain_dotnet_operation(
+            "call-references", target,
+            {"method": token, "direction": direction, "max_methods": max_methods,
+             "limit": limit, "timeout": timeout},
+            result,
+        )
+    outgoing = []
+    if direction in {"outgoing", "both"}:
+        outgoing = [
+            {"from": token, **_public_il_call(call)}
+            for call in selected["calls"][:limit]
+        ]
+    incoming = []
+    incoming_total = 0
+    if direction in {"incoming", "both"}:
+        for caller in index["methods"]:
+            for call in caller["calls"]:
+                if _call_matches_method(call["target"], selected):
+                    incoming_total += 1
+                    if len(incoming) < limit:
+                        incoming.append({
+                            "from_token": caller["token"],
+                            "from_type": _public_il_identifier(caller["declaring_type"]),
+                            "from_method": _public_il_identifier(caller["name"]),
+                            **_public_il_call(call),
+                        })
+    overloads = [
+        row for row in index["method_rows"]
+        if row.get("DeclaringType") == selected["declaring_type"]
+        and row.get("Name") == selected["name"]
+    ]
+    result = {
+        "provider": "ILSpyCmd", "tool_version": ILSPY_VERSION,
+        "target": str(target), "method": token, "direction": direction,
+        "method_identity": {
+            "declaring_type": _public_il_identifier(selected["declaring_type"]),
+            "name": _public_il_identifier(selected["name"]), "rva": selected["rva"],
+        },
+        "outgoing": outgoing,
+        "outgoing_total": len(selected["calls"]),
+        "incoming": incoming,
+        "incoming_total": incoming_total,
+        "results_truncated": (
+            (direction in {"outgoing", "both"} and len(selected["calls"]) > len(outgoing))
+            or (direction in {"incoming", "both"} and incoming_total > len(incoming))
+        ),
+        "index": {
+            "method_count": index["method_count"],
+            "indexed_count": index["indexed_count"],
+            "truncated": index["index_truncated"],
+        },
+        "limitations": [
+            "Static IL call operands only; reflection, delegates, and runtime dispatch are not resolved.",
+            *(["Incoming overload attribution is name/type based because ILSpy's table dump does not decode signature blobs."] if len(overloads) > 1 else []),
+        ],
+        "partial": index["index_truncated"],
+        "raw_il_saved_to": index["saved_to"],
+    }
+    return _retain_dotnet_operation(
+        "call-references", target,
+        {"method": token, "direction": direction, "max_methods": max_methods,
+         "limit": limit, "timeout": timeout},
+        result,
+    )
+
+
+@tool()
+def dotnet_search(path: str, query: str, max_methods: int = 1000,
+                  limit: int = 100, case_sensitive: bool = False,
+                  timeout: int = 240) -> dict:
+    """Search bounded decoded IL method bodies for a literal string.
+
+    Each match is attributed to an exact MethodDef token. This intentionally
+    avoids attacker-controlled regular expressions and does not execute code.
+    """
+    query = _dotnet_text(query, "query", 256)
+    _, limit = _bounded_page(0, limit)
+    target = _dotnet_target(path)
+    index, failure = _dotnet_il_index(target, max_methods, timeout)
+    if failure is not None:
+        failure["query"] = query
+        return failure
+    needle = query if case_sensitive else query.casefold()
+    matches = []
+    matched_methods = 0
+    for method_row in index["methods"]:
+        lines = []
+        count = 0
+        for line in method_row["body"].splitlines():
+            haystack = line if case_sensitive else line.casefold()
+            if needle in haystack:
+                count += haystack.count(needle)
+                if len(lines) < 5:
+                    lines.append(_preview(_redact_text(line.strip())[0], 1000))
+        if count:
+            matched_methods += 1
+            if len(matches) < limit:
+                matches.append({
+                    "token": method_row["token"],
+                    "declaring_type": _public_il_identifier(method_row["declaring_type"]),
+                    "method": _public_il_identifier(method_row["name"]),
+                    "match_count": count,
+                    "matching_lines": lines,
+                })
+    result = {
+        "provider": "ILSpyCmd", "tool_version": ILSPY_VERSION,
+        "target": str(target), "query": query, "mode": "literal",
+        "case_sensitive": case_sensitive, "matches": matches,
+        "matched_methods": matched_methods,
+        "results_truncated": matched_methods > len(matches),
+        "index": {
+            "method_count": index["method_count"],
+            "indexed_count": index["indexed_count"],
+            "truncated": index["index_truncated"],
+        },
+        "partial": index["index_truncated"],
+        "raw_il_saved_to": index["saved_to"],
+    }
+    return _retain_dotnet_operation(
+        "search", target,
+        {"query": query, "max_methods": max_methods, "limit": limit,
+         "case_sensitive": case_sensitive, "timeout": timeout},
+        result,
+    )
+
+
+@tool()
+def dotnet_list_resources(path: str, query: str | None = None,
+                          offset: int = 0, limit: int = 200,
+                          timeout: int = 120) -> dict:
+    """List CLR resources, including entries ILSpy can see inside .resources.
+
+    Listing is read-only. Use dotnet_extract_resources for path-safe extraction
+    of raw manifest resources into the content-addressed derived store.
+    """
+    offset, limit = _bounded_page(offset, limit)
+    target = _dotnet_target(path)
+    run, saved = _ilspy_run(
+        target, ["--list-resources"], timeout=timeout,
+        output_limit=4 * 1024 * 1024,
+    )
+    failure = _ilspy_failure(run, saved)
+    if failure is not None:
+        return failure
+    resources = [line.strip() for line in run["stdout"].splitlines() if line.strip()]
+    rows = [{"name": name} for name in resources]
+    page = _page_rows(rows, query, offset, limit)
+    return {
+        "provider": "ILSpyCmd", "tool_version": ILSPY_VERSION,
+        "target": str(target), "resources": page,
+        "saved_to": str(saved),
+        "extraction_hint": (
+            "dotnet_extract_resources extracts raw manifest resources without trusting names as paths"
+        ),
+    }
+
+
+# --------------------------------------------------------------------------- documents / scripts
+
+
+def _bounded_parser_int(value: int, name: str, minimum: int, maximum: int) -> int:
+    value = int(value)
+    if not minimum <= value <= maximum:
+        raise ValueError(f"{name} must be between {minimum} and {maximum}")
+    return value
+
+
+def _document_target(path: str) -> tuple[Path, dict]:
+    target = _sample(path)
+    size = target.stat().st_size
+    if size > MAX_DOCUMENT_INPUT:
+        raise ValueError(
+            f"document exceeds {MAX_DOCUMENT_INPUT} byte input limit ({size} bytes)"
+        )
+    detection = detect_format(target, original_name=_original_name_for(target))
+    if detection["format"] not in DOCUMENT_FORMATS:
+        raise ValueError(
+            f"document tool does not accept detected format {detection['format']}"
+        )
+    return target, detection
+
+
+def _script_target(path: str, language: str) -> tuple[Path, dict]:
+    target = _sample(path)
+    size = target.stat().st_size
+    if size > MAX_SCRIPT_INPUT:
+        raise ValueError(f"script exceeds {MAX_SCRIPT_INPUT} byte input limit ({size} bytes)")
+    detection = detect_format(target, original_name=_original_name_for(target))
+    accepted = {"auto", "javascript", "jscript", "vbscript", "powershell", "vba", "unknown"}
+    if language not in accepted:
+        raise ValueError(f"language must be one of: {', '.join(sorted(accepted))}")
+    if language == "auto" and detection["format"] not in SCRIPT_FORMATS | {"vba"}:
+        raise ValueError(
+            f"script tool needs an explicit language for detected format {detection['format']}"
+        )
+    return target, detection
+
+
+def _worker_script_language(language: str, detection: dict) -> str:
+    if language != "auto":
+        return language
+    detected = detection.get("format")
+    return detected if detected in SCRIPT_FORMATS | {"vba"} else "unknown"
+
+
+def _module_worker_json(module: str, command: list[str], timeout: int,
+                        max_output_bytes: int = MAX_DOCUMENT_OUTPUT) -> tuple[dict | None, dict]:
+    run = _run(
+        [sys.executable, "-m", module, *command],
+        timeout=timeout,
+        max_output_bytes=max_output_bytes,
+    )
+    document = None
+    if run["stdout"]:
+        try:
+            decoded = json.loads(run["stdout"])
+            if isinstance(decoded, dict):
+                document = decoded
+        except json.JSONDecodeError:
+            pass
+    return document, run
+
+
+def _worker_json(command: list[str], timeout: int) -> tuple[dict | None, dict]:
+    return _module_worker_json("blackwall_lab.documents", command, timeout)
+
+
+def _extractor_worker_json(command: list[str], timeout: int) -> tuple[dict | None, dict]:
+    return _module_worker_json(
+        "blackwall_lab.extractors", command, timeout, MAX_EXTRACTION_OUTPUT,
+    )
+
+
+def _native_worker_json(command: list[str], timeout: int) -> tuple[dict | None, dict]:
+    return _module_worker_json(
+        "blackwall_lab.native", command, timeout, MAX_EXTRACTION_OUTPUT,
+    )
+
+
+def _retained_parser_result(prefix: str, identity: dict, document: dict, run: dict) -> dict:
+    token = hashlib.sha256(
+        json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()[:16]
+    retained = {
+        "schema": "blackwall.retained-parser-result.v1",
+        "result": document,
+        "worker": {
+            key: run.get(key)
+            for key in (
+                "rc", "status", "seconds", "timed_out", "cancelled",
+                "crashed", "termination_signal", "output_limited",
+            )
+        },
+        "stderr": run.get("stderr", ""),
+    }
+    saved = _save(f"{prefix}-{token}.json", retained)
+    redacted, redactions = _redact_value(document)
+    encoded = json.dumps(redacted, ensure_ascii=False, default=str)
+    if len(encoded) <= 30_000:
+        response = redacted
+    else:
+        response = {
+            "schema": document.get("schema"),
+            "format": document.get("format"),
+            "language": document.get("language"),
+            "target": document.get("target"),
+            "counts": {
+                key: len(document.get(key, []))
+                for key in (
+                    "findings", "relationships", "urls", "commands",
+                    "decoded_strings", "payload_candidates", "artifacts", "errors",
+                )
+                if isinstance(document.get(key), list)
+            },
+            "result_preview": _clip(encoded, 24_000),
+            "result_truncated": True,
+        }
+        for key in (
+            "router_format", "tool_version", "expected_tool_version",
+            "macro_count", "finding_count", "count", "total_bytes", "error",
+        ):
+            value = redacted.get(key)
+            if key in redacted and (
+                value is None or isinstance(value, (str, int, float, bool))
+            ):
+                response[key] = value
+    response.update({
+        "provider": "BlackWall bounded static worker",
+        "saved_to": str(saved),
+        "redactions": redactions,
+        "rc": run.get("rc"),
+        "timed_out": run.get("timed_out", False),
+        "cancelled": run.get("cancelled", False),
+        "crashed": run.get("crashed", False),
+        "output_limited": run.get("output_limited", False),
+        "seconds": run.get("seconds"),
+    })
+    if run.get("rc") != 0:
+        response["error"] = _clip(
+            str(document.get("error") or run.get("stderr") or "parser worker failed"),
+            2000,
+        )
+    return response
+
+
+@tool()
+def document_triage(path: str, max_members: int = 1024,
+                    max_member_bytes: int = 2 * 1024 * 1024,
+                    max_total_bytes: int = 16 * 1024 * 1024,
+                    timeout: int = 120) -> dict:
+    """Statically triage OOXML, OLE, RTF, or PDF structure in an isolated
+    worker. Reports active-content markers, URLs, commands, and relationships
+    with source provenance. Archive expansion, member count/size, aggregate
+    bytes, parser output, memory, and wall time are bounded."""
+    max_members = _bounded_parser_int(max_members, "max_members", 1, 4096)
+    max_member_bytes = _bounded_parser_int(
+        max_member_bytes, "max_member_bytes", 1, 8 * 1024 * 1024,
+    )
+    max_total_bytes = _bounded_parser_int(
+        max_total_bytes, "max_total_bytes", 1, 32 * 1024 * 1024,
+    )
+    timeout = _bounded_parser_int(timeout, "timeout", 5, 300)
+    target, detection = _document_target(path)
+    command = [
+        "document-triage", str(target),
+        "--max-members", str(max_members),
+        "--member-limit", str(max_member_bytes),
+        "--total-limit", str(max_total_bytes),
+    ]
+    document, run = _worker_json(command, timeout)
+    if document is None:
+        document = {
+            "schema": "blackwall.worker-error.v1",
+            "error": "document worker returned invalid JSON",
+            "stderr": _clip(run.get("stderr", ""), 2000),
+        }
+    document["router_format"] = detection["format"]
+    return _retained_parser_result(
+        "document-triage",
+        {
+            "target": str(target), "max_members": max_members,
+            "max_member_bytes": max_member_bytes,
+            "max_total_bytes": max_total_bytes,
+        },
+        document, run,
+    )
+
+
+@tool()
+def document_vba(path: str, timeout: int = 180) -> dict:
+    """Extract and deobfuscate VBA statically with pinned oletools/olevba.
+    Native Office applications and VBA interpreters are never launched. Full
+    bounded JSON, including macro source, is retained under /work/out."""
+    timeout = _bounded_parser_int(timeout, "timeout", 10, 300)
+    target, detection = _document_target(path)
+    run = _run(
+        [
+            sys.executable, "-m", "blackwall_lab.documents", "vba-analyze",
+            str(target), "--olevba-bin", OLEVBA_BIN,
+        ],
+        timeout=timeout,
+        max_output_bytes=MAX_DOCUMENT_OUTPUT,
+    )
+    parsed = None
+    if run["stdout"]:
+        try:
+            candidate = json.loads(run["stdout"])
+            if isinstance(candidate, list):
+                parsed = candidate
+        except json.JSONDecodeError:
+            pass
+    macro_count = 0
+    finding_count = 0
+    tool_version = None
+    if parsed is not None:
+        for item in parsed:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "MetaInformation":
+                tool_version = item.get("version")
+            macros = item.get("macros")
+            analysis = item.get("analysis")
+            if isinstance(macros, list):
+                macro_count += len(macros)
+            if isinstance(analysis, list):
+                finding_count += len(analysis)
+    document = {
+        "schema": "blackwall.vba-analysis.v1",
+        "provider": "olevba",
+        "tool_version": tool_version,
+        "expected_tool_version": OLETOOLS_VERSION,
+        "router_format": detection["format"],
+        "macro_count": macro_count,
+        "finding_count": finding_count,
+        "documents": parsed,
+    }
+    if parsed is None:
+        document["error"] = "olevba returned invalid JSON"
+        document["output_preview"] = _clip(run.get("stdout", ""), 4000)
+    elif tool_version != OLETOOLS_VERSION:
+        document["version_warning"] = (
+            f"expected oletools {OLETOOLS_VERSION}, observed {_preview(tool_version)}"
+        )
+    return _retained_parser_result(
+        "document-vba", {"target": str(target), "timeout": timeout}, document, run,
+    )
+
+
+def _registered_worker_artifacts(
+    target: Path,
+    output_dir: Path,
+    document: dict,
+    *,
+    max_artifacts: int,
+    max_artifact_bytes: int,
+    max_total_bytes: int,
+    relationship: str,
+    producer_tool: str,
+) -> tuple[list[dict], list[dict]]:
+    rows = document.get("artifacts")
+    if not isinstance(rows, list):
+        return [], [{"reason": "worker result has no artifact array"}]
+    registered = []
+    rejected = []
+    total = 0
+    root = output_dir.resolve()
+    for row in rows[:max_artifacts]:
+        if not isinstance(row, dict):
+            rejected.append({"reason": "artifact metadata is not an object"})
+            continue
+        filename = row.get("file")
+        if not isinstance(filename, str) or not re.fullmatch(r"artifact-\d{4}\.bin", filename):
+            rejected.append({"reason": "worker artifact name violated generated-name policy"})
+            continue
+        candidate = output_dir / filename
+        try:
+            resolved = candidate.resolve(strict=True)
+            stat_result = resolved.stat()
+        except OSError as exc:
+            rejected.append({"file": filename, "reason": f"unreadable artifact: {exc}"})
+            continue
+        if resolved.parent != root or candidate.is_symlink() or not resolved.is_file():
+            rejected.append({"file": filename, "reason": "artifact escaped output directory"})
+            continue
+        size = stat_result.st_size
+        if size > max_artifact_bytes or total + size > max_total_bytes:
+            rejected.append({"file": filename, "reason": "artifact byte limit exceeded"})
+            continue
+        digest = _sha256_path(resolved)
+        if row.get("size") != size or row.get("sha256") != digest:
+            rejected.append({"file": filename, "reason": "artifact metadata mismatch"})
+            continue
+        kind = _preview(row.get("kind") or "embedded artifact", 120)
+        source = _preview(row.get("source") or "unknown source", 300)
+        try:
+            registration = _register_derived(
+                resolved,
+                f"{kind} from {target.name} at {source}",
+                parent=target,
+                relationship=relationship,
+                producer_tool=producer_tool,
+            )
+        except ValueError as exc:
+            rejected.append({"file": filename, "reason": f"lineage admission rejected: {exc}"})
+            continue
+        derived = Path(registration["path"])
+        registered.append({
+            **{key: value for key, value in row.items() if key != "file"},
+            "path": str(derived),
+            "magic": _run(["file", "-b", str(derived)], timeout=10)["stdout"].strip(),
+            "lineage": registration,
+        })
+        total += size
+    if len(rows) > max_artifacts:
+        rejected.append({"reason": f"worker returned more than {max_artifacts} artifacts"})
+    return registered, rejected
+
+
+@tool()
+def document_extract_artifacts(path: str, max_members: int = 1024,
+                               max_artifacts: int = 32,
+                               max_artifact_bytes: int = 8 * 1024 * 1024,
+                               max_total_bytes: int = 32 * 1024 * 1024,
+                               max_depth: int = 2,
+                               timeout: int = 120) -> dict:
+    """Extract bounded embedded document parts without trusting member names.
+    OOXML active parts, OLE package/VBA streams, RTF objdata, and PDF active or
+    embedded streams receive generated names and content-addressed lineage."""
+    max_members = _bounded_parser_int(max_members, "max_members", 1, 4096)
+    max_artifacts = _bounded_parser_int(max_artifacts, "max_artifacts", 1, 128)
+    max_artifact_bytes = _bounded_parser_int(
+        max_artifact_bytes, "max_artifact_bytes", 1, 8 * 1024 * 1024,
+    )
+    max_total_bytes = _bounded_parser_int(
+        max_total_bytes, "max_total_bytes", 1, 32 * 1024 * 1024,
+    )
+    max_depth = _bounded_parser_int(max_depth, "max_depth", 0, 4)
+    timeout = _bounded_parser_int(timeout, "timeout", 5, 300)
+    target, detection = _document_target(path)
+    with tempfile.TemporaryDirectory(prefix="blackwall-document-") as temporary:
+        output_dir = Path(temporary)
+        command = [
+            "document-extract", str(target), str(output_dir),
+            "--max-members", str(max_members),
+            "--max-artifacts", str(max_artifacts),
+            "--member-limit", str(max_artifact_bytes),
+            "--total-limit", str(max_total_bytes),
+            "--max-depth", str(max_depth),
+        ]
+        document, run = _worker_json(command, timeout)
+        if document is None:
+            document = {
+                "schema": "blackwall.worker-error.v1",
+                "error": "document extraction worker returned invalid JSON",
+                "artifacts": [],
+            }
+        registered, rejected = _registered_worker_artifacts(
+            target, output_dir, document,
+            max_artifacts=max_artifacts,
+            max_artifact_bytes=max_artifact_bytes,
+            max_total_bytes=max_total_bytes,
+            relationship="document-embedded-artifact",
+            producer_tool="lab.document_extract_artifacts",
+        )
+    document["router_format"] = detection["format"]
+    document["artifacts"] = registered
+    document["count"] = len(registered)
+    document["registration_rejections"] = rejected
+    return _retained_parser_result(
+        "document-artifacts",
+        {
+            "target": str(target), "max_members": max_members,
+            "max_artifacts": max_artifacts, "max_artifact_bytes": max_artifact_bytes,
+            "max_total_bytes": max_total_bytes, "max_depth": max_depth,
+        },
+        document, run,
+    )
+
+
+@tool()
+def script_analyze(path: str, language: str = "auto", max_layers: int = 4,
+                   max_decoded_bytes: int = 4 * 1024 * 1024,
+                   timeout: int = 60) -> dict:
+    """Statically detect and deobfuscate JavaScript/JScript, VBScript, VBA,
+    and PowerShell without invoking a native script engine. Returns decoded
+    strings, commands, URLs, and rule findings with transform provenance."""
+    max_layers = _bounded_parser_int(max_layers, "max_layers", 0, 8)
+    max_decoded_bytes = _bounded_parser_int(
+        max_decoded_bytes, "max_decoded_bytes", 1, 32 * 1024 * 1024,
+    )
+    timeout = _bounded_parser_int(timeout, "timeout", 5, 180)
+    target, detection = _script_target(path, language)
+    worker_language = _worker_script_language(language, detection)
+    command = [
+        "script-analyze", str(target), "--language", worker_language,
+        "--max-layers", str(max_layers),
+        "--decoded-limit", str(max_decoded_bytes),
+    ]
+    document, run = _worker_json(command, timeout)
+    if document is None:
+        document = {
+            "schema": "blackwall.worker-error.v1",
+            "error": "script worker returned invalid JSON",
+        }
+    document["router_format"] = detection["format"]
+    return _retained_parser_result(
+        "script-analysis",
+        {
+            "target": str(target), "language": language,
+            "worker_language": worker_language,
+            "max_layers": max_layers, "max_decoded_bytes": max_decoded_bytes,
+        },
+        document, run,
+    )
+
+
+@tool()
+def script_extract_payloads(path: str, language: str = "auto",
+                            max_layers: int = 4, max_artifacts: int = 16,
+                            max_artifact_bytes: int = 8 * 1024 * 1024,
+                            max_total_bytes: int = 16 * 1024 * 1024,
+                            timeout: int = 60) -> dict:
+    """Decode script-carried Base64/hex/encoded-command payloads into the
+    content-addressed derived store. Every payload records its transform and
+    source offset; no script interpreter is used."""
+    max_layers = _bounded_parser_int(max_layers, "max_layers", 0, 8)
+    max_artifacts = _bounded_parser_int(max_artifacts, "max_artifacts", 1, 128)
+    max_artifact_bytes = _bounded_parser_int(
+        max_artifact_bytes, "max_artifact_bytes", 1, 8 * 1024 * 1024,
+    )
+    max_total_bytes = _bounded_parser_int(
+        max_total_bytes, "max_total_bytes", 1, 32 * 1024 * 1024,
+    )
+    timeout = _bounded_parser_int(timeout, "timeout", 5, 180)
+    target, detection = _script_target(path, language)
+    worker_language = _worker_script_language(language, detection)
+    with tempfile.TemporaryDirectory(prefix="blackwall-script-") as temporary:
+        output_dir = Path(temporary)
+        command = [
+            "script-extract", str(target), str(output_dir),
+            "--language", worker_language,
+            "--max-layers", str(max_layers),
+            "--max-artifacts", str(max_artifacts),
+            "--member-limit", str(max_artifact_bytes),
+            "--total-limit", str(max_total_bytes),
+        ]
+        document, run = _worker_json(command, timeout)
+        if document is None:
+            document = {
+                "schema": "blackwall.worker-error.v1",
+                "error": "script extraction worker returned invalid JSON",
+                "artifacts": [],
+            }
+        registered, rejected = _registered_worker_artifacts(
+            target, output_dir, document,
+            max_artifacts=max_artifacts,
+            max_artifact_bytes=max_artifact_bytes,
+            max_total_bytes=max_total_bytes,
+            relationship="script-decoded-payload",
+            producer_tool="lab.script_extract_payloads",
+        )
+    document["router_format"] = detection["format"]
+    document["artifacts"] = registered
+    document["count"] = len(registered)
+    document["registration_rejections"] = rejected
+    return _retained_parser_result(
+        "script-payloads",
+        {
+            "target": str(target), "language": language,
+            "worker_language": worker_language,
+            "max_layers": max_layers, "max_artifacts": max_artifacts,
+            "max_artifact_bytes": max_artifact_bytes,
+            "max_total_bytes": max_total_bytes,
+        },
+        document, run,
+    )
+
+
 # --------------------------------------------------------------------------- format parsers
 
 
@@ -739,23 +2016,29 @@ def dotnet_info(path: str) -> dict:
     names, user strings (#US heap), resources. Use when pe_info says dotnet=true."""
     import dnfile
 
-    p = _sample(path)
+    p = _dotnet_target(path)
     pe = dnfile.dnPE(str(p))
     if not getattr(pe, "net", None):
         raise ValueError("not a .NET assembly")
     md = pe.net.mdtables
     types, methods, us = [], [], []
     if md.TypeDef:
-        for t in md.TypeDef:
+        for index, t in enumerate(md.TypeDef):
+            if index >= 5_000:
+                break
             value = _redact_text(f"{t.TypeNamespace}.{t.TypeName}")[0]
             types.append(_preview(value))
     if md.MethodDef:
-        for m in md.MethodDef:
+        for index, m in enumerate(md.MethodDef):
+            if index >= 10_000:
+                break
             methods.append(_preview(_redact_text(str(m.Name))[0]))
     if pe.net.user_strings:
         off = 1
         heap = pe.net.user_strings
-        while off < heap.sizeof():
+        iterations = 0
+        while off < heap.sizeof() and iterations < 10_000:
+            iterations += 1
             try:
                 s = heap.get(off)
             except Exception:
@@ -766,11 +2049,17 @@ def dotnet_info(path: str) -> dict:
             us.append(_preview(_redact_text(str(value))[0], 1000))
             off += max(1, s.raw_size if hasattr(s, "raw_size") else 1)
     asm = md.Assembly[0] if md.Assembly else None
+    manifest_resources = []
+    for index, resource in enumerate(md.ManifestResource or []):
+        if index >= 4_096:
+            break
+        manifest_resources.append(_preview(resource.Name))
     result = {
         "assembly": _preview(_redact_text(str(asm.Name))[0]) if asm else None,
         "version": f"{asm.MajorVersion}.{asm.MinorVersion}.{asm.BuildNumber}.{asm.RevisionNumber}" if asm else None,
         "types": types, "methods": methods, "user_strings": us,
-        "manifest_resources": [_preview(r.Name) for r in (md.ManifestResource or [])],
+        "manifest_resources": manifest_resources,
+        "limits": {"types": 5000, "methods": 10000, "user_strings": 10000},
     }
     saved = _save(f"dotnet_info-{p.name[:16]}.json", result)
     return {
@@ -780,18 +2069,34 @@ def dotnet_info(path: str) -> dict:
         "user_string_count": len(us), "user_strings": _bounded_values(us, 150, 14000),
         "manifest_resources": _bounded_values(result["manifest_resources"], 100, 4000),
         "saved_to": str(saved),
-        "hint": "Use dotnet_extract_resources for embedded payloads/data. A custom dnfile script requires an explicitly selected expert profile until ILSpy support lands.",
+        "hint": "Use dotnet_inventory for tokens, dotnet_decompile for C#, dotnet_search/call_references for method analysis, and the bounded resource tools for embedded data.",
     }
 
 
 @tool()
-def dotnet_extract_resources(path: str, min_size: int = 1) -> dict:
+def dotnet_extract_resources(path: str, min_size: int = 1,
+                             resource_name: str | None = None,
+                             max_resources: int = 64,
+                             max_resource_bytes: int = 32 * 1024 * 1024,
+                             max_total_bytes: int = 64 * 1024 * 1024) -> dict:
     """Extract embedded CLR manifest resources without executing the assembly.
     Each blob is content-addressed under samples/derived. Linked/external
-    resources are reported but not followed."""
+    resources are reported but not followed. Optional exact-name selection and
+    count/per-resource/aggregate byte limits bound derived artifact creation."""
     import dnfile
 
-    p = _sample(path)
+    if not 0 <= int(min_size) <= 32 * 1024 * 1024:
+        raise ValueError("min_size must be between 0 and 33554432")
+    if not 1 <= int(max_resources) <= 256:
+        raise ValueError("max_resources must be between 1 and 256")
+    if not 1 <= int(max_resource_bytes) <= 64 * 1024 * 1024:
+        raise ValueError("max_resource_bytes must be between 1 and 67108864")
+    if not 1 <= int(max_total_bytes) <= 128 * 1024 * 1024:
+        raise ValueError("max_total_bytes must be between 1 and 134217728")
+    if resource_name is not None:
+        resource_name = _dotnet_text(resource_name, "resource_name", 1024)
+
+    p = _dotnet_target(path)
     pe = dnfile.dnPE(str(p))
     if not getattr(pe, "net", None):
         raise ValueError("not a .NET assembly")
@@ -799,11 +2104,29 @@ def dotnet_extract_resources(path: str, min_size: int = 1) -> dict:
     base_rva = int(pe.net.struct.ResourcesRva)
     file_size = p.stat().st_size
     extracted, skipped = [], []
-    for resource in resources:
-        name = _preview(_redact_text(str(resource.Name))[0])
+    skipped_omitted = 0
+
+    def record_skip(item: dict) -> None:
+        nonlocal skipped_omitted
+        if len(skipped) < 500:
+            skipped.append(item)
+        else:
+            skipped_omitted += 1
+
+    total_bytes = 0
+    selected_found = False
+    for resource_index, resource in enumerate(resources):
+        if resource_index >= 4096:
+            record_skip({"reason": "manifest resource scan stopped at 4096 rows"})
+            break
+        raw_name = str(resource.Name)
+        name = _preview(_redact_text(raw_name)[0])
+        if resource_name is not None and raw_name != resource_name:
+            continue
+        selected_found = True
         implementation = getattr(resource, "Implementation", None)
         if implementation is not None and getattr(implementation, "row", None) is not None:
-            skipped.append({"name": name, "reason": "external or linked resource"})
+            record_skip({"name": name, "reason": "external or linked resource"})
             continue
         try:
             rva = base_rva + int(resource.Offset)
@@ -813,14 +2136,24 @@ def dotnet_extract_resources(path: str, min_size: int = 1) -> dict:
             size = int.from_bytes(size_data, "little")
             if size > file_size:
                 raise ValueError(f"resource length exceeds file size ({size}/{file_size} bytes)")
+            if size > max_resource_bytes:
+                raise ValueError(
+                    f"resource exceeds max_resource_bytes ({size}/{max_resource_bytes} bytes)"
+                )
+            if total_bytes + size > max_total_bytes:
+                raise ValueError(
+                    f"aggregate extraction would exceed max_total_bytes ({max_total_bytes} bytes)"
+                )
+            if len(extracted) >= max_resources:
+                raise ValueError(f"resource count exceeds max_resources ({max_resources})")
             blob = pe.get_data(rva + 4, size)
             if len(blob) != size:
                 raise ValueError(f"resource is truncated ({len(blob)}/{size} bytes)")
         except Exception as exc:
-            skipped.append({"name": name, "reason": str(exc)})
+            record_skip({"name": name, "reason": str(exc)})
             continue
         if size < max(0, min_size):
-            skipped.append({"name": name, "size": size, "reason": "below min_size"})
+            record_skip({"name": name, "size": size, "reason": "below min_size"})
             continue
         with tempfile.NamedTemporaryFile(dir="/tmp", delete=False) as tf:
             tf.write(blob)
@@ -842,7 +2175,27 @@ def dotnet_extract_resources(path: str, min_size: int = 1) -> dict:
             "entropy": _entropy(blob), "head": blob[:16].hex(),
             "lineage": registration,
         })
-    return {"extracted": extracted, "skipped": skipped, "count": len(extracted)}
+        total_bytes += size
+    if resource_name is not None and not selected_found:
+        record_skip({"name": _preview(resource_name), "reason": "resource not found"})
+    result = {
+        "extracted": extracted, "skipped": skipped, "count": len(extracted),
+        "skipped_omitted": skipped_omitted,
+        "total_bytes": total_bytes,
+        "limits": {
+            "max_resources": max_resources,
+            "max_resource_bytes": max_resource_bytes,
+            "max_total_bytes": max_total_bytes,
+        },
+    }
+    identity = hashlib.sha256(json.dumps({
+        "target": str(p), "resource_name": resource_name,
+        "min_size": min_size, "max_resources": max_resources,
+        "max_resource_bytes": max_resource_bytes,
+        "max_total_bytes": max_total_bytes,
+    }, sort_keys=True).encode()).hexdigest()[:16]
+    result["saved_to"] = str(_save(f"dotnet-resources-{identity}.json", result))
+    return result
 
 
 @tool()
@@ -881,6 +2234,31 @@ def elf_info(path: str) -> dict:
     }
     result["saved_to"] = str(_save(f"elf_info-{p.name[:16]}.json", result))
     return result
+
+
+@tool()
+def macho_info(path: str, timeout: int = 120) -> dict:
+    """Parse Mach-O headers, segments, sections, linked libraries, imports,
+    exports, symbols, code-signature structure, and Objective-C/Swift markers
+    in a supervised worker. Signature bytes are hashed but trust-chain and
+    notarization verification are deliberately not claimed."""
+    timeout = _bounded_parser_int(timeout, "timeout", 5, 300)
+    target = _sample(path)
+    if target.stat().st_size > MAX_NATIVE_INPUT:
+        raise ValueError(f"Mach-O input exceeds {MAX_NATIVE_INPUT} bytes")
+    detection = detect_format(target, original_name=_original_name_for(target))
+    if detection["format"] != "mach-o":
+        raise ValueError(f"Mach-O tool does not accept detected format {detection['format']}")
+    document, run = _native_worker_json(["macho", str(target)], timeout)
+    if document is None:
+        document = {
+            "schema": "blackwall.worker-error.v1",
+            "error": "native worker returned invalid JSON",
+        }
+    document["router_format"] = detection["format"]
+    return _retained_parser_result(
+        "macho-metadata", {"target": str(target), "timeout": timeout}, document, run,
+    )
 
 
 # --------------------------------------------------------------------------- REA static analysis
@@ -1017,6 +2395,40 @@ def rea_objdump(path: str, operation: str, timeout: int = 600) -> dict:
     return _rea_run(
         p, f"objdump_{operation}",
         ["inspect-with-objdump", str(p), operation], timeout,
+    )
+
+
+@tool()
+def rea_elf_layout(path: str, timeout: int = 300) -> dict:
+    """Inspect an ELF64 x86-64 file layout with REA's exact isolated
+    pwntools 4.15.0 / pyelftools 0.33 / Unicorn 2.1.2 provider profile.
+    This is a static file parser: it never launches the selected ELF."""
+    timeout = _bounded_parser_int(timeout, "timeout", 10, 600)
+    target = _sample(path)
+    detection = detect_format(target, original_name=_original_name_for(target))
+    if detection["format"] != "elf":
+        raise ValueError(
+            f"ELF layout tool does not accept detected format {detection['format']}"
+        )
+    return _rea_run(
+        target, "elf_layout", ["inspect-binary-layout", str(target)], timeout,
+    )
+
+
+@tool()
+def rea_recorded_crash(path: str, timeout: int = 300) -> dict:
+    """Parse a supplied Linux ELF64 amd64/AArch64 core with REA's exact
+    isolated pwntools provider. Historical registers, notes, and mappings are
+    treated only as recorded evidence; no target or debugger is launched."""
+    timeout = _bounded_parser_int(timeout, "timeout", 10, 600)
+    target = _sample(path)
+    detection = detect_format(target, original_name=_original_name_for(target))
+    if detection["format"] != "elf-core":
+        raise ValueError(
+            f"recorded-core tool does not accept detected format {detection['format']}"
+        )
+    return _rea_run(
+        target, "recorded_crash", ["inspect-recorded-crash", str(target)], timeout,
     )
 
 
@@ -1188,6 +2600,106 @@ def rea_android_method(path: str, class_name: str, method_name: str,
             raise ValueError("overload_index must be between 0 and 10000")
         arguments.extend(["--overload-index", str(overload_index)])
     return _rea_run(p, "android_method", arguments, timeout)
+
+
+@tool()
+def android_decompile(path: str, class_name: str,
+                      method_name: str | None = None,
+                      overload_index: int | None = None,
+                      timeout: int = 600) -> dict:
+    """Decompile one Java/Kotlin class or selected method through the pinned
+    JADX 1.5.6 engine in the checksum-verified jadx-headless-mcp 0.7.1 bridge.
+    The APK is parsed statically and is never installed or launched."""
+    target = _sample(path)
+    detection = detect_format(target, original_name=_original_name_for(target))
+    if detection["format"] != "apk":
+        raise ValueError(f"Android decompiler does not accept {detection['format']}")
+    if method_name is None:
+        result = rea_android_class(path, class_name, timeout)
+    else:
+        result = rea_android_method(
+            path, class_name, method_name,
+            overload_index=overload_index, timeout=timeout,
+        )
+    result["engine"] = {
+        "name": "JADX", "version": JADX_ENGINE_VERSION,
+        "bridge": "jadx-headless-mcp", "bridge_version": JADX_BRIDGE_VERSION,
+    }
+    return result
+
+
+@tool()
+def android_resources(path: str, max_resources: int = 128,
+                      max_resource_bytes: int = 8 * 1024 * 1024,
+                      max_total_bytes: int = 32 * 1024 * 1024,
+                      timeout: int = 600) -> dict:
+    """Decode APK manifest/resource metadata through pinned JADX and safely
+    extract bounded raw ``res/``, ``assets/``, manifest, and resources.arsc
+    entries under generated names. ZIP paths are evidence only and every
+    accepted resource receives content-addressed lineage."""
+    max_resources = _bounded_parser_int(max_resources, "max_resources", 1, 512)
+    max_resource_bytes = _bounded_parser_int(
+        max_resource_bytes, "max_resource_bytes", 1, 64 * 1024 * 1024,
+    )
+    max_total_bytes = _bounded_parser_int(
+        max_total_bytes, "max_total_bytes", 1, 256 * 1024 * 1024,
+    )
+    timeout = _bounded_parser_int(timeout, "timeout", 10, 900)
+    target = _sample(path)
+    detection = detect_format(target, original_name=_original_name_for(target))
+    if detection["format"] != "apk":
+        raise ValueError(f"Android resource tool does not accept {detection['format']}")
+
+    analysis_path = _rea_typed_snapshot(target, ".apk")
+    jadx = _rea_run(
+        target, "android_resources",
+        ["inspect-android-package", str(analysis_path)], timeout,
+    )
+    worker_timeout = min(timeout, 300)
+    with tempfile.TemporaryDirectory(prefix="blackwall-android-") as temporary:
+        output_dir = Path(temporary)
+        document, run = _extractor_worker_json([
+            "extract", str(target), str(output_dir),
+            "--max-artifacts", str(max_resources),
+            "--max-artifact-bytes", str(max_resource_bytes),
+            "--max-total-bytes", str(max_total_bytes),
+            "--android-only",
+        ], worker_timeout)
+        if document is None:
+            document = {
+                "schema": "blackwall.worker-error.v1",
+                "error": "Android extraction worker returned invalid JSON",
+                "artifacts": [],
+            }
+        registered, rejected = _registered_worker_artifacts(
+            target, output_dir, document,
+            max_artifacts=max_resources,
+            max_artifact_bytes=max_resource_bytes,
+            max_total_bytes=max_total_bytes,
+            relationship="android-resource",
+            producer_tool="lab.android_resources",
+        )
+    combined = {
+        **document,
+        "router_format": detection["format"],
+        "engine": {
+            "name": "JADX", "version": JADX_ENGINE_VERSION,
+            "bridge": "jadx-headless-mcp", "bridge_version": JADX_BRIDGE_VERSION,
+        },
+        "jadx_evidence": jadx,
+        "artifacts": registered,
+        "count": len(registered),
+        "registration_rejections": rejected,
+    }
+    return _retained_parser_result(
+        "android-resources",
+        {
+            "target": str(target), "max_resources": max_resources,
+            "max_resource_bytes": max_resource_bytes,
+            "max_total_bytes": max_total_bytes,
+        },
+        combined, run,
+    )
 
 
 # --------------------------------------------------------------------------- capability / strings / signatures
@@ -1525,6 +3037,127 @@ def yara_test(rule: str, path: str | None = None, save_as: str | None = None) ->
     return {"compiled": True, "results": res, "saved": bool(save_as)}
 
 
+def _detection_export_dir() -> Path | None:
+    return CASE / "detections" if CASE.is_dir() else None
+
+
+@tool()
+def generate_yara_candidate(
+    name: str,
+    evidence_ids: list[str],
+    strings: list[str],
+    positive_paths: list[str],
+    hex_patterns: list[str] | None = None,
+    minimum_matches: int | None = None,
+    negative_paths: list[str] | None = None,
+) -> dict:
+    """Build a constrained evidence-linked YARA candidate and export it only
+    after it compiles, matches every positive, and matches no negatives.
+
+    BlackWall always adds the bundled inert corpus as a negative set. Inputs
+    are literal text anchors or fixed byte/wildcard hex anchors; arbitrary rule
+    source is not accepted by this generator. Use ``yara_test`` for a manually
+    authored rule that should not receive the generator's validation claim.
+    """
+    positives = [_routing_sample(path) for path in positive_paths]
+    explicit_negatives = [_routing_sample(path) for path in (negative_paths or [])]
+    fixture_negatives = [
+        path for path in sorted(BENCHMARK_FIXTURES.iterdir())
+        if path.is_file() and not path.is_symlink()
+    ] if BENCHMARK_FIXTURES.is_dir() else []
+    return generate_yara(
+        name=name,
+        evidence_ids=evidence_ids,
+        strings=strings,
+        hex_patterns=hex_patterns,
+        minimum_matches=minimum_matches,
+        positive_paths=positives,
+        negative_paths=explicit_negatives + fixture_negatives,
+        state=WORK / "state",
+        output=WORK / "rules",
+        export=_detection_export_dir(),
+    )
+
+
+@tool()
+def generate_sigma_candidate(
+    title: str,
+    name: str,
+    telemetry: str,
+    selection: dict,
+    evidence_ids: list[str],
+) -> dict:
+    """Generate an evidence-linked Sigma candidate from a fixed telemetry
+    schema. Supported categories are process_creation, registry_set,
+    file_event, network_connection, and dns_query. Unsupported fields fail
+    closed instead of implying telemetry that the evidence cannot supply.
+    """
+    return generate_sigma(
+        title=title,
+        name=name,
+        telemetry=telemetry,
+        selection=selection,
+        evidence_ids=evidence_ids,
+        state=WORK / "state",
+        output=WORK / "rules",
+        export=_detection_export_dir(),
+    )
+
+
+@tool()
+def generate_suricata_candidate(
+    name: str,
+    telemetry: str,
+    indicator: str,
+    evidence_ids: list[str],
+) -> dict:
+    """Generate an evidence-linked Suricata candidate through a fixed safe
+    template. Telemetry is one of dns, http_host, http_uri, tls_sni, or ip.
+    """
+    return generate_suricata(
+        name=name,
+        kind=telemetry,
+        indicator=indicator,
+        evidence_ids=evidence_ids,
+        state=WORK / "state",
+        output=WORK / "rules",
+        export=_detection_export_dir(),
+    )
+
+
+@tool()
+def attack_behavior_catalog() -> dict:
+    """List the reviewed behavior-to-ATT&CK mappings available for evidence-
+    linked candidate generation. Model-only technique IDs are not accepted.
+    """
+    return {
+        "schema": "blackwall.attack-catalog.v1",
+        "behaviors": [
+            {"behavior": behavior, **mapping}
+            for behavior, mapping in sorted(ATTACK_BEHAVIORS.items())
+        ],
+    }
+
+
+@tool()
+def attack_map_behavior(
+    behavior: str,
+    evidence_ids: list[str],
+    confidence: str = "medium",
+) -> dict:
+    """Map a reviewed behavior to ATT&CK with explicit evidence and graded
+    confidence. Unknown behaviors fail closed for analyst review.
+    """
+    return map_attack(
+        behavior=behavior,
+        evidence_ids=evidence_ids,
+        confidence=confidence,
+        state=WORK / "state",
+        output=WORK / "rules",
+        export=_detection_export_dir(),
+    )
+
+
 # --------------------------------------------------------------------------- unpacking / carving
 
 
@@ -1625,6 +3258,263 @@ def carve_embedded(path: str, min_size: int = 1024, run_binwalk: bool = False,
     return result
 
 
+def _config_worker(target: Path, family: str, timeout: int) -> tuple[dict, dict]:
+    document, run = _extractor_worker_json(
+        ["config", str(target), "--family", family], timeout,
+    )
+    if document is None:
+        document = {
+            "schema": "blackwall.worker-error.v1",
+            "error": "configuration worker returned invalid JSON",
+            "matches": [],
+        }
+    return document, run
+
+
+@tool()
+def config_extractors(timeout: int = 30) -> dict:
+    """List the statically registered family configuration extractors.
+    Plugins are package code reviewed with BlackWall; sample bytes can never
+    select an import path or inject executable plugin code."""
+    timeout = _bounded_parser_int(timeout, "timeout", 5, 60)
+    document, run = _extractor_worker_json(["list-configs"], timeout)
+    if document is None:
+        document = {
+            "schema": "blackwall.worker-error.v1",
+            "error": "configuration registry worker returned invalid JSON",
+            "extractors": [],
+        }
+    return _retained_parser_result(
+        "config-extractors", {"operation": "list", "timeout": timeout}, document, run,
+    )
+
+
+@tool()
+def config_extract(path: str, family: str = "auto", timeout: int = 60) -> dict:
+    """Run bounded family-specific static configuration extractors. Results
+    include a low/medium/high confidence grade, reasons, validation state, and
+    source byte ranges. Full values are retained locally and response secrets
+    are redacted."""
+    timeout = _bounded_parser_int(timeout, "timeout", 5, 180)
+    target = _sample(path)
+    document, run = _config_worker(target, family, timeout)
+    return _retained_parser_result(
+        "configuration",
+        {"target": str(target), "family": family, "timeout": timeout},
+        document, run,
+    )
+
+
+def _route_derived_artifact(path: Path, original_name: str | None) -> dict:
+    detection = detect_format(path, original_name=original_name)
+    plan = build_analysis_plan(
+        path, display_path=str(path), original_name=original_name, phase="full",
+    )
+    return {
+        "detection": detection,
+        "plan_id": plan["plan_id"],
+        "ready_tools": [
+            step["tool"] for step in plan["selected"] if step["state"] == "ready"
+        ],
+        "deferred_tools": [
+            step["tool"] for step in plan["selected"] if step["state"] == "deferred"
+        ],
+    }
+
+
+@tool()
+def recursive_unpack(path: str, max_depth: int = 3, max_artifacts: int = 64,
+                     max_artifact_bytes: int = 32 * 1024 * 1024,
+                     max_expanded_bytes: int = 128 * 1024 * 1024,
+                     max_elapsed_seconds: int = 300,
+                     recover_configurations: bool = True) -> dict:
+    """Traverse nested archives, CAB installers, UPX layers, U-Boot images,
+    and newc CPIO files as a bounded breadth-first graph. Every worker output
+    uses a generated path, is size/digest revalidated, receives parent lineage,
+    and is immediately passed back through the deterministic format router.
+    Depth, artifact count, per-artifact bytes, aggregate bytes, and elapsed time
+    are independent hard bounds; repeated content is not expanded twice."""
+    max_depth = _bounded_parser_int(max_depth, "max_depth", 0, 8)
+    max_artifacts = _bounded_parser_int(max_artifacts, "max_artifacts", 1, 256)
+    max_artifact_bytes = _bounded_parser_int(
+        max_artifact_bytes, "max_artifact_bytes", 1, 64 * 1024 * 1024,
+    )
+    max_expanded_bytes = _bounded_parser_int(
+        max_expanded_bytes, "max_expanded_bytes", 1, 512 * 1024 * 1024,
+    )
+    max_elapsed_seconds = _bounded_parser_int(
+        max_elapsed_seconds, "max_elapsed_seconds", 5, 900,
+    )
+    root = _routing_sample(path)
+    root_size = root.stat().st_size
+    if root_size > MAX_EXTRACTION_INPUT:
+        raise ValueError(
+            f"recursive extraction input exceeds {MAX_EXTRACTION_INPUT} bytes"
+        )
+    started = time.monotonic()
+    root_digest = _sha256_path(root)
+    queue = deque([(root, root_digest, 0, _original_name_for(root))])
+    expanded: set[str] = set()
+    artifacts = []
+    nodes = []
+    rejections = []
+    configurations = []
+    total_bytes = 0
+    stop_reason = "complete"
+
+    while queue:
+        elapsed = time.monotonic() - started
+        if elapsed >= max_elapsed_seconds:
+            stop_reason = "elapsed_time_limit"
+            break
+        current, current_digest, depth, name_hint = queue.popleft()
+        if current_digest in expanded:
+            nodes.append({
+                "sha256": current_digest, "path": str(current), "depth": depth,
+                "status": "deduplicated", "reason": "content already expanded",
+            })
+            continue
+        expanded.add(current_digest)
+        route = _route_derived_artifact(current, name_hint)
+        node = {
+            "sha256": current_digest, "path": str(current), "depth": depth,
+            "route": route, "status": "depth_limit" if depth >= max_depth else "pending",
+        }
+        nodes.append(node)
+
+        if recover_configurations and current.stat().st_size <= 1024 * 1024:
+            remaining_budget = max_elapsed_seconds - (time.monotonic() - started)
+            if remaining_budget < 1:
+                stop_reason = "elapsed_time_limit"
+                break
+            remaining = int(remaining_budget)
+            config_document, config_run = _config_worker(current, "auto", min(60, remaining))
+            matches = config_document.get("matches")
+            if isinstance(matches, list) and matches:
+                configurations.append({
+                    "artifact_sha256": current_digest,
+                    "path": str(current),
+                    "matches": matches,
+                    "worker_status": config_run.get("status"),
+                })
+
+        if depth >= max_depth:
+            continue
+        remaining_count = max_artifacts - len(artifacts)
+        remaining_bytes = max_expanded_bytes - total_bytes
+        if remaining_count <= 0:
+            stop_reason = "artifact_count_limit"
+            break
+        if remaining_bytes <= 0:
+            stop_reason = "expanded_byte_limit"
+            break
+        remaining_budget = max_elapsed_seconds - (time.monotonic() - started)
+        if remaining_budget < 1:
+            stop_reason = "elapsed_time_limit"
+            break
+        remaining_time = int(remaining_budget)
+        with tempfile.TemporaryDirectory(prefix="blackwall-recursive-") as temporary:
+            output_dir = Path(temporary)
+            document, run = _extractor_worker_json([
+                "extract", str(current), str(output_dir),
+                "--max-artifacts", str(remaining_count),
+                "--max-artifact-bytes", str(min(max_artifact_bytes, remaining_bytes)),
+                "--max-total-bytes", str(remaining_bytes),
+            ], min(180, remaining_time))
+            if document is None:
+                document = {
+                    "schema": "blackwall.worker-error.v1",
+                    "error": "extraction worker returned invalid JSON",
+                    "artifacts": [],
+                }
+            node["extractor"] = document.get("extractor")
+            node["supported"] = bool(document.get("supported"))
+            node["worker"] = {
+                key: run.get(key) for key in (
+                    "status", "rc", "seconds", "timed_out", "crashed", "output_limited",
+                )
+            }
+            registered, rejected = _registered_worker_artifacts(
+                current, output_dir, document,
+                max_artifacts=remaining_count,
+                max_artifact_bytes=min(max_artifact_bytes, remaining_bytes),
+                max_total_bytes=remaining_bytes,
+                relationship=f"recursive-extraction:{document.get('extractor') or 'unknown'}",
+                producer_tool="lab.recursive_unpack",
+            )
+        node["status"] = (
+            "extracted" if registered else
+            "unsupported" if document.get("supported") is False else
+            "no_artifacts"
+        )
+        node["artifact_count"] = len(registered)
+        worker_rejections = document.get("rejections")
+        if isinstance(worker_rejections, list):
+            for item in worker_rejections[:128]:
+                if isinstance(item, dict):
+                    rejections.append({"parent_sha256": current_digest, **item})
+        for item in rejected:
+            rejections.append({"parent_sha256": current_digest, **item})
+        for child in registered:
+            child_path = Path(child["path"])
+            child_size = int(child["size"])
+            total_bytes += child_size
+            source_name = child.get("source") if isinstance(child.get("source"), str) else None
+            child_route = _route_derived_artifact(child_path, source_name)
+            record = {
+                **child,
+                "parent_sha256": current_digest,
+                "depth": depth + 1,
+                "route": child_route,
+            }
+            artifacts.append(record)
+            child_digest = child["sha256"]
+            if depth + 1 <= max_depth and child_digest not in expanded:
+                queue.append((child_path, child_digest, depth + 1, source_name))
+            if len(artifacts) >= max_artifacts:
+                stop_reason = "artifact_count_limit"
+                break
+            if total_bytes >= max_expanded_bytes:
+                stop_reason = "expanded_byte_limit"
+                break
+        if stop_reason != "complete":
+            break
+
+    elapsed = round(time.monotonic() - started, 3)
+    graph = {
+        "schema": "blackwall.recursive-extraction-graph.v1",
+        "root": {"path": str(root), "sha256": root_digest},
+        "nodes": nodes,
+        "artifacts": artifacts,
+        "configurations": configurations,
+        "rejections": rejections[:512],
+        "counts": {
+            "expanded_nodes": len(expanded),
+            "artifacts": len(artifacts),
+            "configuration_matches": sum(len(row["matches"]) for row in configurations),
+            "expanded_bytes": total_bytes,
+        },
+        "limits": {
+            "max_depth": max_depth, "max_artifacts": max_artifacts,
+            "max_artifact_bytes": max_artifact_bytes,
+            "max_expanded_bytes": max_expanded_bytes,
+            "max_elapsed_seconds": max_elapsed_seconds,
+            "archive_expansion_ratio": 100,
+        },
+        "elapsed_seconds": elapsed,
+        "stop_reason": stop_reason,
+    }
+    identity = hashlib.sha256(json.dumps({
+        "root": root_digest, "limits": graph["limits"],
+        "recover_configurations": recover_configurations,
+    }, sort_keys=True).encode()).hexdigest()[:16]
+    saved = _save(f"recursive-unpack-{identity}.json", graph)
+    redacted, redactions = _redact_value(graph)
+    redacted["saved_to"] = str(saved)
+    redacted["redactions"] = redactions
+    return redacted
+
+
 @tool()
 def extract_pe_resource(path: str, rva: str, size: int, label: str = "resource") -> dict:
     """Dump a PE resource (rva/size from pe_info) to samples/derived for further
@@ -1657,6 +3547,47 @@ def extract_pe_resource(path: str, rva: str, size: int, label: str = "resource")
 
 
 @tool()
+def emulate_elf(path: str, max_instructions: int = 100_000,
+                emulation_timeout_ms: int = 5_000,
+                timeout: int = 30) -> dict:
+    """Emulate an ELF entry point with Unicorn under explicit instruction,
+    wall-time, mapped-memory, trace, and worker resource limits. System calls
+    stop emulation and are never forwarded; there is no host filesystem,
+    network, dynamic loader, or native sample execution. Supports bounded x86,
+    x86-64, ARM, AArch64, and MIPS entry-point probes."""
+    max_instructions = _bounded_parser_int(
+        max_instructions, "max_instructions", 1, 1_000_000,
+    )
+    emulation_timeout_ms = _bounded_parser_int(
+        emulation_timeout_ms, "emulation_timeout_ms", 1, 60_000,
+    )
+    timeout = _bounded_parser_int(timeout, "timeout", 5, 120)
+    target = _sample(path)
+    detection = detect_format(target, original_name=_original_name_for(target))
+    if detection["format"] != "elf":
+        raise ValueError(f"ELF emulator does not accept detected format {detection['format']}")
+    document, run = _native_worker_json([
+        "emulate-elf", str(target),
+        "--max-instructions", str(max_instructions),
+        "--timeout-ms", str(emulation_timeout_ms),
+    ], timeout)
+    if document is None:
+        document = {
+            "schema": "blackwall.worker-error.v1",
+            "error": "native emulation worker returned invalid JSON",
+        }
+    document["router_format"] = detection["format"]
+    return _retained_parser_result(
+        "elf-emulation",
+        {
+            "target": str(target), "max_instructions": max_instructions,
+            "emulation_timeout_ms": emulation_timeout_ms, "timeout": timeout,
+        },
+        document, run,
+    )
+
+
+@tool()
 def emulate_windows(path: str, timeout: int = 60, shellcode_arch: str | None = None,
                     export: str | None = None, max_api_calls: int = 3000) -> dict:
     """Emulate a Windows PE (or raw shellcode with shellcode_arch='x86'|'amd64')
@@ -1676,7 +3607,7 @@ def emulate_windows(path: str, timeout: int = 60, shellcode_arch: str | None = N
                 return {
                     "unsupported_format": "dotnet",
                     "error": "Speakeasy does not support .NET assemblies",
-                    "hint": "Use dotnet_info, dotnet_extract_resources, and capa. Custom dnfile scripts require the expert profile.",
+                    "hint": "Use dotnet_inventory, dotnet_decompile, dotnet_search, dotnet_call_references, and the bounded resource tools.",
                 }
         except Exception:
             pass
@@ -1731,8 +3662,8 @@ def hexdump(path: str, offset: int = 0, length: int = 256) -> str:
 @tool(profiles=frozenset({"expert"}))
 def run_python(code: str, timeout: int = 120) -> dict:
     """Execute a Python 3 script inside the sandbox (cwd /work, no network).
-    Available: pefile, lief, dnfile, yara, capstone, unicorn, speakeasy,
-    Crypto (pycryptodome), ppdeep, tlsh, stdlib. Use for decrypting strings and
+    Available: pefile, lief, dnfile, oletools/olefile, yara, capstone, unicorn,
+    speakeasy, Crypto (pycryptodome), ppdeep, tlsh, stdlib. Use for decrypting strings and
     configs, resolving API hashes, patching, slicing blobs, brute-forcing XOR keys.
     Write any produced binaries to /work/scratch and register them with
     register_derived. Print results to stdout."""
@@ -1841,6 +3772,9 @@ def profile_manifest(profile: str, app: FastMCP | None = None) -> dict:
         "tools": sorted(actual),
         "expert_only_tools": sorted(EXPERT_ONLY_TOOLS),
         "runtime_rea_commands_exposed": [],
+        "unadvertised_optional_rea_commands": sorted(
+            REA_UNADVERTISED_OPTIONAL_COMMANDS
+        ),
     }
 
 

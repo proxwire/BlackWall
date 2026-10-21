@@ -107,6 +107,17 @@ class EvidenceStoreTests(unittest.TestCase):
         self.assertIn("triage.first", checkpoint["recorded_gap_steps"])
         self.assertNotIn("triage.first", resumed["remaining_ready_steps"])
 
+    def test_redundant_step_is_checkpointed_without_a_false_gap(self):
+        record, checkpoint = self.record(
+            result={"status": "not_run_redundant", "reason": "equivalent evidence"},
+            normalized={"status": "not_run_redundant", "gap": None},
+        )
+        resumed = self.store.ensure_plan(self.plan)
+        self.assertEqual(record["status"], "not_run_redundant")
+        self.assertIn("triage.first", checkpoint["redundant_steps"])
+        self.assertNotIn("triage.first", checkpoint["recorded_gap_steps"])
+        self.assertNotIn("triage.first", resumed["remaining_ready_steps"])
+
     def test_checkpoint_recovers_evidence_committed_before_an_interruption(self):
         evidence, _ = self.record()
         checkpoint_path = self.store.checkpoint_dir / f"{self.plan['plan_id']}.json"

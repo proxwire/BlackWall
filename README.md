@@ -2,21 +2,32 @@
 
 Lets AI drive malware reverse engineering. Pull a sample, and seconds later
 Claude Code is reversing it with persistent Ghidra, capa, FLOSS, YARA, REA's
-cross-format static analyzers, bounded unpacking, and Speakeasy emulation. The
-sample stays sealed inside a container with no network access. Arbitrary shell,
-Python, and radare2 access require an explicit expert-profile opt-in.
+cross-format static analyzers, ILSpy .NET decompilation, oletools-backed
+document/script analysis, pinned JADX, Mach-O/ELF tooling, recursive extraction,
+configuration recovery, and bounded emulation. The sample stays sealed inside
+a container with no network access. Arbitrary shell, Python, and radare2 access
+require an explicit expert-profile opt-in.
+
+The existing Docker **analysis sandbox** is for static parsing and bounded
+emulation; it does not execute native samples. The separate hardware-isolated
+KVM **detonation sandbox** is still unbuilt and is the next major roadmap
+milestone.
 
 ```
 blackwall setup                      # once: build the image (~3 GB) and check the host
 blackwall pull <sha256>              # from MalwareBazaar   (or: blackwall add ./suspicious.exe)
 blackwall analyze <id> [--auto]      # strict profile (default) + Claude Code
 blackwall analyze <id> --profile expert  # explicit scriptable-tool opt-in
+blackwall status <id>                # checkpoints + live CPU/memory/PIDs
+blackwall resume <id>                # continue only pending checkpoint work
+blackwall compare <left> <right>     # stable artifact/finding/detection diff
+blackwall archive <id>               # encrypted, manifested portable case
 ```
 
 ## How it's isolated
 
 ```
- host                                     │  sandbox container  bw-<sha12>
+ host                                     │  static-analysis container  bw-<sha12>
                                           │  --network none, cap-drop ALL, no-new-privileges,
  ~/BlackWall-cases/<sha256>/              │  read-only rootfs, non-root, mem/cpu/pids limits
    sample.zip  (pw: infected) ──ro mount──┼─▶ /case/sample.zip ──bw-init──▶ /work/samples/original/<sha>
@@ -54,6 +65,32 @@ blackwall analyze <id> --profile expert  # explicit scriptable-tool opt-in
   and other runtime commands are not MCP tools, and optional Frida is not
   installed. Full Evidence JSON is retained under `/work/out` while bounded,
   secret-redacted results are returned to the analyst.
+- ILSpyCmd 11.1.0.9782 and its .NET 10.0.13 runtime are separately pinned and
+  checksum-verified. The strict profile exposes only bounded assembly/type/
+  method inventory, token-selected C# decompilation and call references,
+  literal method search, and path-safe resource operations. See the
+  [full .NET lane](docs/dotnet-analysis.md).
+- `oletools==0.60.2` and BlackWall's isolated static worker cover OLE/OOXML,
+  RTF, PDF, VBA, JavaScript/JScript, VBScript, and PowerShell. Member counts,
+  expansion, decoded bytes, depth, output, memory, and time are bounded;
+  extracted payloads use generated names and content-addressed lineage. No
+  native document or script interpreter is invoked. See the
+  [document/script lane](docs/document-script-analysis.md).
+- The Android lane uses checksum-verified `jadx-headless-mcp` 0.7.1 with JADX
+  1.5.6 for package/resource evidence and focused Java/Kotlin class or method
+  decompilation. Mach-O gets supervised metadata, import/export, signature-
+  structure, and Objective-C/Swift discovery plus the persistent Ghidra route.
+- REA's ELF layout and recorded-core workflows run through a separate,
+  hash-locked `pwntools==4.15.0` provider environment. Bounded ELF entry-point
+  emulation uses Unicorn 2.1.4 in the main environment, stops at syscalls, and
+  has no loader, host filesystem, network, or native execution.
+- `lab.recursive_unpack` walks ZIP/TAR/compression, uncompressed/MSZIP/Quantum/LZX CAB,
+  UPX, U-Boot uImage, and newc CPIO layers under global depth/count/byte/time
+  limits. Every output has a generated name, is independently revalidated,
+  receives parent lineage, and is immediately rerouted. PE `RCDATA` CABs are
+  automatically carved; reviewed static configuration-extractor plugins,
+  including Amadey v4/v5, return source ranges and graded confidence. See the
+  [native/mobile/extraction lanes](docs/native-mobile-extraction.md).
 - Before analysis, `lab.analysis_plan` performs bounded, non-extracting format
   detection and writes a deterministic plan with selected and skipped tools,
   reasons, deadlines, deferred inputs, and fallbacks. Native PE/ELF work stays
@@ -70,19 +107,28 @@ blackwall analyze <id> --profile expert  # explicit scriptable-tool opt-in
   disagreements remain visible. Reports and Ghidra annotations can carry
   claim citations that `lab.audit_evidence` verifies back to exact tool output.
   See the [evidence and resume model](docs/evidence.md).
+- Host lifecycle commands expose checkpoint/resource status, resume and cancel
+  without losing state, rebuild deterministic evidence reports, compare cases
+  or individual runs, and export/import encrypted manifest-verified bundles.
+  See [case management](docs/case-management.md).
+- Evidence-linked YARA candidates must pass positive and inert-negative tests
+  before export. Fixed-schema Sigma/Suricata candidates and reviewed ATT&CK
+  mappings are included in the stable JSON case report. See
+  [detection output](docs/detection-output.md).
 - The workflow instructs the analyst never to execute samples. Dynamic
   behaviour comes from Speakeasy *emulation* (Windows APIs, filesystem,
   registry, and network are all emulated). The expert profile deliberately
   restores scriptable Python, shell, and radare2 access, so its no-execution
-  rule is a policy boundary; use a stronger isolation runtime for samples
-  outside your container threat model.
+  rule is a policy boundary. BlackWall currently has no native-detonation
+  command; the required KVM execution boundary remains a design in
+  [`docs/safe-execution.md`](docs/safe-execution.md).
 
 ## What the AI gets
 
 | server | profile | tools |
 |---|---|---|
 | `ghidra` | strict + expert | decompile, xrefs, call graphs, strings, imports/exports, semantic code search, read bytes, disassemble, import new layers, **rename / retype / set prototypes / comment** (persisted in the project) |
-| `lab` | strict + expert | Deterministic resumable plans; evidence, lineage, finding reconciliation, claim audit; core triage plus REA cross-format workflows and static Ghidra-backed native function dossiers, feature tracing, and bounded value-flow analysis; focused managed-code, Android, EVM, HAR/SAZ/qlog, GNU objdump, capa, FLOSS, Binwalk, YARA, bounded unpacking/carving, and Speakeasy emulation |
+| `lab` | strict + expert | Deterministic resumable plans; evidence, lineage, finding reconciliation, claim audit; bounded ILSpy, document/script, JADX Android, Mach-O, ELF/core, recursive extraction, configuration recovery, Unicorn/Speakeasy emulation, REA static workflows, capa, FLOSS, Binwalk, and YARA |
 | `radare2` | expert | r2mcp second-opinion disassembly/analysis and any architecture r2 supports |
 | `lab` script tools | expert | Arbitrary `run_python` and `shell` operations inside the networkless sample container |
 | `intel` | strict + expert | MalwareBazaar (hash, family), ThreatFox, URLhaus, VirusTotal (lookup only) |
@@ -103,8 +149,9 @@ evidence standard.
   parser, or low-level radare2 operation. BlackWall prints a conspicuous
   warning each time and never remembers expert as the default for a later run.
 - `blackwall doctor` reports the profile it is auditing and exits nonzero if
-  the MCP server set, lab-tool allowlist, REA static-command boundary, or host
-  permission policy has drifted. It also verifies the inert cross-format
+  the MCP server set, lab-tool allowlist, REA static-command boundary, pinned
+  ILSpy/JADX and exact pwntools providers, native/extraction workers, or host
+  permission policy have drifted. It also verifies the inert cross-format
   corpus and runs deterministic router, evidence/resume, benchmark, Ghidra
   readiness, and failure-supervision admission checks.
 - After `blackwall setup` rebuilds the image, the next `start` or `analyze`
@@ -131,14 +178,27 @@ evidence standard.
   bridge is exposed only after an MCP readiness probe confirms that all
   imported programs have completed Ghidra analysis. Code/string semantic
   indexes may finish later and remain separately visible in the status.
-- Ghidra is weak on .NET IL. `dotnet_info` covers metadata and
-  `dotnet_extract_resources` safely extracts embedded CLR resources. REA adds
-  static PE/CLI member, CIL-anchor, string-literal, and native-boundary
-  inspection, but it is not a full interactive IL decompiler.
+- Static .NET call references cannot resolve reflection, delegates, generated
+  code, or runtime dispatch. ILSpy provides focused C# while REA supplies an
+  independent managed-code view; mixed-mode native boundaries additionally
+  route into persistent Ghidra. Obfuscated output still requires analyst
+  reconciliation across those evidence sources.
+- Document parsing is triage rather than rendering: encrypted content,
+  malformed/uncommon PDF filters, XLM behavior, VBA stomping, and values
+  assembled only at runtime may remain invisible. Script detections and
+  bounded deobfuscation are heuristic; a recovered command is not proof it
+  executed. Exact bounds and parser tradeoffs are documented in the
+  [document/script lane](docs/document-script-analysis.md).
+- JADX output can be incomplete under malformed or heavily obfuscated DEX.
+  Mach-O signature reporting is structural and does not verify Apple trust or
+  notarization. ELF emulation models instructions and memory, not an operating
+  system. Recursive extraction supports a finite format set and reports every
+  unsupported codec or layer as a gap. Exact bounds and coverage are in the
+  [native/mobile/extraction guide](docs/native-mobile-extraction.md).
 - REA 6.7.0's desktop-application and IL2CPP commands are not present in its
-  published CLI. Its ELF binary-layout and recorded-core workflows require a
-  separate exact pwntools provider profile. BlackWall does not advertise those
-  lanes until their dependencies and smoke tests are present.
+  published CLI. BlackWall verifies that manifest fact and does not advertise
+  those workflows; they need real upstream commands, dependencies, and smoke
+  tests before they can be added.
 
 ## How REA enhances BlackWall
 
@@ -173,6 +233,14 @@ both dependency ecosystems. Image integration tests use inert inputs to cover
 Ghidra readiness, timeout/cancellation process groups, parser crashes, a full
 tmpfs, corrupt archives, and stale-container volume retention. CI never pulls
 or stores malware samples.
+
+Signed semantic-version tags run the separate release workflow. It publishes
+the tested Linux/amd64 image to GHCR by digest, signs it with keyless Cosign,
+attaches GitHub provenance and SBOM attestations, and uploads deterministic
+CycloneDX inventories for Python, npm, and the installed image. See the
+[release/verification guide](docs/release.md), the
+[supported-platform matrix](docs/supported-platforms.md), and
+[third-party notices](THIRD_PARTY_NOTICES.md).
 
 The temporary ChromaDB exceptions are governed by
 `.github/dependency-exceptions.json`. CI queries the official PyPI and OSV APIs,
@@ -210,6 +278,19 @@ uv pip compile lab/requirements.txt \
   --output-file lab/requirements.lock
 ```
 
+REA's deliberately isolated pwntools provider uses
+`rea-runtime/pwntools-requirements.txt` and its own hash lock. Regenerate that
+lock independently so its Unicorn 2.1.2 requirement cannot change the main
+BlackWall Unicorn 2.1.4 environment:
+
+```bash
+uv pip compile rea-runtime/pwntools-requirements.txt \
+  --python-version 3.12 \
+  --python-platform x86_64-manylinux_2_39 \
+  --generate-hashes \
+  --output-file rea-runtime/pwntools-requirements.lock
+```
+
 Before a release, run `./blackwall setup` (or build the image directly),
 `./blackwall doctor`, optionally audit the opt-in surface with
 `./blackwall doctor --profile expert`, and confirm `git diff --check` is clean.
@@ -218,13 +299,16 @@ analysis output.
 
 ## License
 
-BlackWall is available under the permissive [MIT License](LICENSE).
+BlackWall is available under the permissive [MIT License](LICENSE). The
+analysis image contains independently licensed tools; see
+[third-party notices](THIRD_PARTY_NOTICES.md).
 
 ## Roadmap
 
 The prioritized implementation plan is in [`docs/roadmap.md`](docs/roadmap.md).
-The P0 foundation (roadmap items 1–5) is complete. The next implementation
-target is item 6, full .NET analysis. Document, script, Android, Mach-O, and
-emulation support follows.
-Native detonation remains gated on the fail-closed KVM design in
+Roadmap items 1–12 and the production-depth follow-ups found by the
+[same-sample validation](docs/benchmarks/same-sample-strict-2026-10-21.md) are
+delivered. The only remaining implementation target is the separately
+isolated dynamic-analysis plane. Native detonation remains unimplemented and
+gated on the fail-closed KVM design in
 [`docs/safe-execution.md`](docs/safe-execution.md).

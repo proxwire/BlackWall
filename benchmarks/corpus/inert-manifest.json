@@ -1,5 +1,5 @@
 {
-  "description": "Source-built fixtures that contain no executable behavior beyond returning constants.",
+  "description": "Source-built fixtures that are never executed; script sources only assign constants, and the attributed third-party VBA sample is inspected statically.",
   "fixtures": [
     {
       "expected": {
@@ -153,8 +153,164 @@
       "raw_rea": {
         "workflow": "managed"
       },
-      "sha256": "174d69263319c8c4d46b8cef752d4c29e4fd31a00c92bbeb20de6df2bf220f93",
+      "sha256": "890393f69ec8e8a4febd6e494491f9fe89469310513b2613e08eae8944d72d2f",
       "size": 4096
+    },
+    {
+      "expected": {
+        "configuration": [
+          "campaign=dotnet-inert"
+        ],
+        "iocs": [
+          "https://dotnet.fixture.invalid/api"
+        ],
+        "report_claims": [
+          {
+            "id": "fixture-identity",
+            "terms": [
+              "BLACKWALL_INERT_DOTNET_FIXTURE"
+            ]
+          },
+          {
+            "id": "endpoint",
+            "terms": [
+              "https://dotnet.fixture.invalid/api"
+            ]
+          },
+          {
+            "id": "configuration",
+            "terms": [
+              "campaign=dotnet-inert"
+            ]
+          }
+        ],
+        "router_format": "dotnet",
+        "useful_evidence": [
+          {
+            "id": "fixture-marker",
+            "terms": [
+              "BLACKWALL_INERT_DOTNET_FIXTURE"
+            ]
+          }
+        ]
+      },
+      "format": "dotnet",
+      "id": "dotnet-mixed",
+      "labels": [
+        "windows",
+        "managed",
+        "mixed-mode-marker"
+      ],
+      "path": "../fixtures/dotnet-mixed.pe",
+      "raw_rea": {
+        "workflow": "managed"
+      },
+      "sha256": "a80aca4fe257264714ecf1c2aa0ee5ac061460426f3a025588f788ae050fecd1",
+      "size": 4096
+    },
+    {
+      "expected": {
+        "configuration": [
+          "campaign=dotnet-obfuscated-inert"
+        ],
+        "iocs": [
+          "https://dotnet-obfuscated.fixture.invalid/api"
+        ],
+        "report_claims": [
+          {
+            "id": "fixture-identity",
+            "terms": [
+              "BLACKWALL_INERT_DOTNET_OBFUSCATED_FIXTURE"
+            ]
+          },
+          {
+            "id": "endpoint",
+            "terms": [
+              "https://dotnet-obfuscated.fixture.invalid/api"
+            ]
+          },
+          {
+            "id": "configuration",
+            "terms": [
+              "campaign=dotnet-obfuscated-inert"
+            ]
+          }
+        ],
+        "router_format": "dotnet",
+        "useful_evidence": [
+          {
+            "id": "fixture-marker",
+            "terms": [
+              "BLACKWALL_INERT_DOTNET_OBFUSCATED_FIXTURE"
+            ]
+          }
+        ]
+      },
+      "format": "dotnet",
+      "id": "dotnet-obfuscated",
+      "labels": [
+        "windows",
+        "managed",
+        "obfuscated-identifiers"
+      ],
+      "path": "../fixtures/dotnet-obfuscated.pe",
+      "raw_rea": {
+        "workflow": "managed"
+      },
+      "sha256": "7effe486e4e88d9be337dd4716d8dd44cad7ce64f390764bd8c96b9384144b5f",
+      "size": 4608
+    },
+    {
+      "expected": {
+        "configuration": [
+          "campaign=dotnet-resource-inert"
+        ],
+        "iocs": [
+          "https://dotnet-resource.fixture.invalid/api"
+        ],
+        "report_claims": [
+          {
+            "id": "fixture-identity",
+            "terms": [
+              "BLACKWALL_INERT_DOTNET_RESOURCE_FIXTURE"
+            ]
+          },
+          {
+            "id": "endpoint",
+            "terms": [
+              "https://dotnet-resource.fixture.invalid/api"
+            ]
+          },
+          {
+            "id": "configuration",
+            "terms": [
+              "campaign=dotnet-resource-inert"
+            ]
+          }
+        ],
+        "router_format": "dotnet",
+        "useful_evidence": [
+          {
+            "id": "fixture-marker",
+            "terms": [
+              "BLACKWALL_INERT_DOTNET_RESOURCE_FIXTURE"
+            ]
+          }
+        ]
+      },
+      "format": "dotnet",
+      "id": "dotnet-resource",
+      "labels": [
+        "windows",
+        "managed",
+        "embedded-resource"
+      ],
+      "path": "../fixtures/dotnet-resource.pe",
+      "raw_rea": {
+        "workflow": "managed"
+      },
+      "sha256": "8873635b3af21a4e6738e29b5864be1550e42f3053e80b7b22bd1a8e66de6fbe",
+      "size": 4608
     },
     {
       "expected": {
@@ -255,8 +411,8 @@
       "raw_rea": {
         "workflow": "android"
       },
-      "sha256": "00e0412d558ab742a3ce38f370830288764566bd96904336241b453847929d30",
-      "size": 1197
+      "sha256": "d6885926399a09d90b4cb0522a91c6c59b5093a82cc65603cc9a93ef782157cb",
+      "size": 1684
     },
     {
       "expected": {
@@ -305,8 +461,164 @@
       "raw_rea": {
         "workflow": "javascript"
       },
-      "sha256": "839b81c34f51386001654d8c205cf7a4e3aef8916602c5aedc6d7dad4dce5e67",
-      "size": 326
+      "sha256": "0a4116a446bac90f2a0d58e06852e9fe06f7417fd56cfd0be9bcdc7b832e558f",
+      "size": 647
+    },
+    {
+      "expected": {
+        "configuration": [
+          "campaign=powershell-inert"
+        ],
+        "iocs": [
+          "https://powershell.fixture.invalid/api"
+        ],
+        "report_claims": [
+          {
+            "id": "fixture-identity",
+            "terms": [
+              "BLACKWALL_INERT_POWERSHELL_FIXTURE"
+            ]
+          },
+          {
+            "id": "endpoint",
+            "terms": [
+              "https://powershell.fixture.invalid/api"
+            ]
+          },
+          {
+            "id": "configuration",
+            "terms": [
+              "campaign=powershell-inert"
+            ]
+          }
+        ],
+        "router_format": "powershell",
+        "useful_evidence": [
+          {
+            "id": "fixture-marker",
+            "terms": [
+              "BLACKWALL_INERT_POWERSHELL_FIXTURE"
+            ]
+          }
+        ]
+      },
+      "format": "powershell",
+      "id": "powershell",
+      "labels": [
+        "script",
+        "safe-deobfuscation",
+        "encoded-command"
+      ],
+      "path": "../fixtures/powershell.ps1",
+      "raw_rea": {
+        "workflow": "artifact"
+      },
+      "sha256": "6cd0f902a38851490acd6993e102c8fd74a2c1efd1e3c33c5fcb1ac1852bf697",
+      "size": 518
+    },
+    {
+      "expected": {
+        "configuration": [
+          "campaign=vbscript-inert"
+        ],
+        "iocs": [
+          "https://vbscript.fixture.invalid/api"
+        ],
+        "report_claims": [
+          {
+            "id": "fixture-identity",
+            "terms": [
+              "BLACKWALL_INERT_VBSCRIPT_FIXTURE"
+            ]
+          },
+          {
+            "id": "endpoint",
+            "terms": [
+              "https://vbscript.fixture.invalid/api"
+            ]
+          },
+          {
+            "id": "configuration",
+            "terms": [
+              "campaign=vbscript-inert"
+            ]
+          }
+        ],
+        "router_format": "vbscript",
+        "useful_evidence": [
+          {
+            "id": "fixture-marker",
+            "terms": [
+              "BLACKWALL_INERT_VBSCRIPT_FIXTURE"
+            ]
+          }
+        ]
+      },
+      "format": "vbscript",
+      "id": "vbscript",
+      "labels": [
+        "script",
+        "safe-deobfuscation",
+        "embedded-payload"
+      ],
+      "path": "../fixtures/vbscript.vbs",
+      "raw_rea": {
+        "workflow": "artifact"
+      },
+      "sha256": "981e8c54abd30b428addb1d3c7811a48decc6ff3a34ccc11e0f3595dc0cb6847",
+      "size": 890
+    },
+    {
+      "expected": {
+        "configuration": [
+          "campaign=vba-inert"
+        ],
+        "iocs": [
+          "https://vba.fixture.invalid/api"
+        ],
+        "report_claims": [
+          {
+            "id": "fixture-identity",
+            "terms": [
+              "BLACKWALL_INERT_VBA_FIXTURE"
+            ]
+          },
+          {
+            "id": "endpoint",
+            "terms": [
+              "https://vba.fixture.invalid/api"
+            ]
+          },
+          {
+            "id": "configuration",
+            "terms": [
+              "campaign=vba-inert"
+            ]
+          }
+        ],
+        "router_format": "vba",
+        "useful_evidence": [
+          {
+            "id": "fixture-marker",
+            "terms": [
+              "BLACKWALL_INERT_VBA_FIXTURE"
+            ]
+          }
+        ]
+      },
+      "format": "vba",
+      "id": "vba-source",
+      "labels": [
+        "script",
+        "vba",
+        "safe-deobfuscation"
+      ],
+      "path": "../fixtures/vba.bas",
+      "raw_rea": {
+        "workflow": "artifact"
+      },
+      "sha256": "c67dab2a445da920a3e10ca35c1288c8d4dfbb405aa8cd4499d25f450a8461fd",
+      "size": 1219
     },
     {
       "expected": {
@@ -406,8 +718,60 @@
       "raw_rea": {
         "workflow": "artifact"
       },
-      "sha256": "6c9c9af7d0d88b890564251f267bd43fccda44635444705483d2a67a95edf386",
-      "size": 1320
+      "sha256": "0eda8240308f006f3d3d6eb021d21732cbfbce60e2bf554bafd2001ec0273f2c",
+      "size": 1797
+    },
+    {
+      "expected": {
+        "configuration": [
+          "campaign=macro-office-inert"
+        ],
+        "iocs": [
+          "https://macro-office.fixture.invalid/api"
+        ],
+        "report_claims": [
+          {
+            "id": "fixture-identity",
+            "terms": [
+              "BLACKWALL_INERT_MACRO_OFFICE_FIXTURE"
+            ]
+          },
+          {
+            "id": "endpoint",
+            "terms": [
+              "https://macro-office.fixture.invalid/api"
+            ]
+          },
+          {
+            "id": "configuration",
+            "terms": [
+              "campaign=macro-office-inert"
+            ]
+          }
+        ],
+        "router_format": "ooxml-spreadsheet",
+        "useful_evidence": [
+          {
+            "id": "fixture-marker",
+            "terms": [
+              "BLACKWALL_INERT_MACRO_OFFICE_FIXTURE"
+            ]
+          }
+        ]
+      },
+      "format": "ooxml-spreadsheet",
+      "id": "office-macro",
+      "labels": [
+        "document",
+        "office",
+        "vba-macro"
+      ],
+      "path": "../fixtures/office-macro.xlsm",
+      "raw_rea": {
+        "workflow": "artifact"
+      },
+      "sha256": "758e83a6f476c38769a7a0aa45276f92cf41922f8656666894e66ae19ff4603c",
+      "size": 18455
     },
     {
       "expected": {
@@ -450,14 +814,15 @@
       "format": "rtf",
       "id": "rtf",
       "labels": [
-        "document"
+        "document",
+        "embedded-object"
       ],
       "path": "../fixtures/document.rtf",
       "raw_rea": {
         "workflow": "artifact"
       },
-      "sha256": "5dc0ca6f6407df6b166793442acf27aec9f1c1138b4a02274937903e8419a496",
-      "size": 91
+      "sha256": "2c6a4ad56a8845f207f9750aefff5f1ce5ddfd5e04f8d4542b02eda11e875725",
+      "size": 296
     },
     {
       "expected": {
@@ -500,14 +865,16 @@
       "format": "pdf",
       "id": "pdf",
       "labels": [
-        "document"
+        "document",
+        "embedded-object",
+        "javascript-action"
       ],
       "path": "../fixtures/document.pdf",
       "raw_rea": {
         "workflow": "artifact"
       },
-      "sha256": "bd2019b44b90ddd9f77e24c34d1f6dc4a8896569c57d10c468f2b30581519317",
-      "size": 690
+      "sha256": "6a12857b58f2b6e7e0631049f676c7849dfeaa083153e4400a616b76450f83ca",
+      "size": 1313
     },
     {
       "expected": {
@@ -559,6 +926,416 @@
       },
       "sha256": "d5eb55bf4ba1c05b6881b93da7af9ae0951b9c789c4bd4b24592651f1a881fe1",
       "size": 163
+    },
+    {
+      "expected": {
+        "configuration": [
+          "campaign=macho-inert"
+        ],
+        "iocs": [
+          "https://macho.fixture.invalid/api"
+        ],
+        "report_claims": [
+          {
+            "id": "fixture-identity",
+            "terms": [
+              "BLACKWALL_INERT_MACHO_FIXTURE"
+            ]
+          },
+          {
+            "id": "endpoint",
+            "terms": [
+              "https://macho.fixture.invalid/api"
+            ]
+          },
+          {
+            "id": "configuration",
+            "terms": [
+              "campaign=macho-inert"
+            ]
+          }
+        ],
+        "router_format": "mach-o",
+        "useful_evidence": [
+          {
+            "id": "fixture-marker",
+            "terms": [
+              "BLACKWALL_INERT_MACHO_FIXTURE"
+            ]
+          }
+        ]
+      },
+      "format": "mach-o",
+      "id": "macho",
+      "labels": [
+        "apple",
+        "native",
+        "objc",
+        "swift",
+        "code-signature"
+      ],
+      "path": "../fixtures/native-macho.macho",
+      "raw_rea": {
+        "workflow": "native_overview"
+      },
+      "sha256": "8536273be728962d7695613edf9681d4e1933c35792af646964388ea59c334f3",
+      "size": 621
+    },
+    {
+      "expected": {
+        "configuration": [
+          "campaign=core-inert"
+        ],
+        "iocs": [
+          "https://core.fixture.invalid/api"
+        ],
+        "report_claims": [
+          {
+            "id": "fixture-identity",
+            "terms": [
+              "BLACKWALL_INERT_ELF_CORE_FIXTURE"
+            ]
+          },
+          {
+            "id": "endpoint",
+            "terms": [
+              "https://core.fixture.invalid/api"
+            ]
+          },
+          {
+            "id": "configuration",
+            "terms": [
+              "campaign=core-inert"
+            ]
+          }
+        ],
+        "router_format": "elf-core",
+        "useful_evidence": [
+          {
+            "id": "fixture-marker",
+            "terms": [
+              "BLACKWALL_INERT_ELF_CORE_FIXTURE"
+            ]
+          }
+        ]
+      },
+      "format": "elf-core",
+      "id": "recorded-core",
+      "labels": [
+        "linux",
+        "recorded-core"
+      ],
+      "path": "../fixtures/recorded-core.elf",
+      "raw_rea": {
+        "workflow": "recorded_crash"
+      },
+      "sha256": "2178b206fc4b2104fe121e78056cbeb5e107f5d2ef4277e5aac556b75c176dab",
+      "size": 618
+    },
+    {
+      "expected": {
+        "configuration": [
+          "firmware-inert"
+        ],
+        "iocs": [
+          "https://firmware.fixture.invalid/api"
+        ],
+        "report_claims": [
+          {
+            "id": "fixture-identity",
+            "terms": [
+              "blackwall-inert-v1"
+            ]
+          },
+          {
+            "id": "endpoint",
+            "terms": [
+              "https://firmware.fixture.invalid/api"
+            ]
+          },
+          {
+            "id": "configuration",
+            "terms": [
+              "firmware-inert"
+            ]
+          }
+        ],
+        "router_format": "zip",
+        "useful_evidence": [
+          {
+            "id": "fixture-marker",
+            "terms": [
+              "blackwall-inert-v1"
+            ]
+          }
+        ]
+      },
+      "format": "zip",
+      "id": "nested-firmware",
+      "labels": [
+        "archive",
+        "firmware",
+        "cpio",
+        "recursive",
+        "config"
+      ],
+      "path": "../fixtures/nested-firmware.zip",
+      "raw_rea": {
+        "workflow": "artifact"
+      },
+      "sha256": "570769435a347bae466f442094072058e2bbf16754f718348c36c92e2830f04c",
+      "size": 397
+    },
+    {
+      "expected": {
+        "configuration": [
+          "cab-inert"
+        ],
+        "iocs": [
+          "https://cab.fixture.invalid/api"
+        ],
+        "report_claims": [
+          {
+            "id": "fixture-identity",
+            "terms": [
+              "BWCFG1"
+            ]
+          },
+          {
+            "id": "endpoint",
+            "terms": [
+              "https://cab.fixture.invalid/api"
+            ]
+          },
+          {
+            "id": "configuration",
+            "terms": [
+              "cab-inert"
+            ]
+          }
+        ],
+        "router_format": "cab",
+        "useful_evidence": [
+          {
+            "id": "fixture-marker",
+            "terms": [
+              "BWCFG1"
+            ]
+          }
+        ]
+      },
+      "format": "cab",
+      "id": "installer-cab",
+      "labels": [
+        "installer",
+        "cab",
+        "recursive",
+        "config"
+      ],
+      "path": "../fixtures/installer.cab",
+      "raw_rea": {
+        "workflow": "artifact"
+      },
+      "sha256": "96a97ae96e32ebdef72a4c55747c3e20a87ae731a893cde415cd4d56a51986aa",
+      "size": 171
+    },
+    {
+      "expected": {
+        "configuration": [],
+        "iocs": [],
+        "report_claims": [
+          {
+            "id": "fixture-identity",
+            "terms": [
+              "lzx.txt"
+            ]
+          }
+        ],
+        "router_format": "cab",
+        "useful_evidence": [
+          {
+            "id": "fixture-marker",
+            "terms": [
+              "lzx.txt"
+            ]
+          }
+        ]
+      },
+      "format": "cab",
+      "id": "installer-lzx",
+      "labels": [
+        "installer",
+        "cab",
+        "lzx",
+        "quantum",
+        "recursive"
+      ],
+      "path": "../fixtures/installer-lzx.cab",
+      "raw_rea": {
+        "workflow": "artifact"
+      },
+      "sha256": "0ce0b55fe705b744d41bb361170c0467db30da0c7f9bdd386d5dade71a78e171",
+      "size": 379
+    },
+    {
+      "expected": {
+        "configuration": [
+          "campaign=native-inert"
+        ],
+        "iocs": [
+          "https://native.fixture.invalid/api"
+        ],
+        "report_claims": [
+          {
+            "id": "fixture-identity",
+            "terms": [
+              "BLACKWALL_INERT_NATIVE_FIXTURE"
+            ]
+          },
+          {
+            "id": "endpoint",
+            "terms": [
+              "https://native.fixture.invalid/api"
+            ]
+          },
+          {
+            "id": "configuration",
+            "terms": [
+              "campaign=native-inert"
+            ]
+          }
+        ],
+        "router_format": "pe",
+        "useful_evidence": [
+          {
+            "id": "fixture-marker",
+            "terms": [
+              "BLACKWALL_INERT_NATIVE_FIXTURE"
+            ]
+          }
+        ]
+      },
+      "format": "pe",
+      "id": "iexpress-cab",
+      "labels": [
+        "windows",
+        "native",
+        "iexpress",
+        "embedded-cab",
+        "lzx"
+      ],
+      "path": "../fixtures/iexpress-cab.pe",
+      "raw_rea": {
+        "workflow": "native_overview"
+      },
+      "sha256": "f5d9f6c66013830066dbf96085a264a045dfa0ad5de37c5d319833a7a24c24b5",
+      "size": 15872
+    },
+    {
+      "expected": {
+        "configuration": [
+          "config-inert"
+        ],
+        "iocs": [
+          "https://config.fixture.invalid/api"
+        ],
+        "report_claims": [
+          {
+            "id": "fixture-identity",
+            "terms": [
+              "BWCFG1"
+            ]
+          },
+          {
+            "id": "endpoint",
+            "terms": [
+              "https://config.fixture.invalid/api"
+            ]
+          },
+          {
+            "id": "configuration",
+            "terms": [
+              "config-inert"
+            ]
+          }
+        ],
+        "router_format": "blackwall-config",
+        "useful_evidence": [
+          {
+            "id": "fixture-marker",
+            "terms": [
+              "BWCFG1"
+            ]
+          }
+        ]
+      },
+      "format": "blackwall-config",
+      "id": "family-config",
+      "labels": [
+        "config",
+        "family-extractor"
+      ],
+      "path": "../fixtures/family-config.bin",
+      "raw_rea": {
+        "workflow": "artifact"
+      },
+      "sha256": "1e22e5303f291ad1a85222a43d79193cfa356f361222e02b4215905057b76528",
+      "size": 90
+    },
+    {
+      "expected": {
+        "configuration": [
+          "a1b2c3"
+        ],
+        "iocs": [
+          "c2.amadey.fixture.invalid"
+        ],
+        "report_claims": [
+          {
+            "id": "fixture-identity",
+            "terms": [
+              "BLACKWALL_INERT_AMADEY_CONFIG"
+            ]
+          },
+          {
+            "id": "endpoint",
+            "terms": [
+              "c2.amadey.fixture.invalid"
+            ]
+          },
+          {
+            "id": "configuration",
+            "terms": [
+              "a1b2c3"
+            ]
+          }
+        ],
+        "router_format": "pe",
+        "useful_evidence": [
+          {
+            "id": "fixture-marker",
+            "terms": [
+              "BLACKWALL_INERT_AMADEY_CONFIG"
+            ]
+          }
+        ]
+      },
+      "format": "pe",
+      "id": "amadey-config",
+      "labels": [
+        "windows",
+        "native",
+        "config",
+        "family-extractor",
+        "amadey",
+        "reconstructed"
+      ],
+      "path": "../fixtures/amadey-config.pe",
+      "raw_rea": {
+        "workflow": "native_overview"
+      },
+      "sha256": "38a8e65eeed21b6200f79216178246fc6532411190ddc1c8b4de0ab154e96847",
+      "size": 15666
     }
   ],
   "generated_by": "benchmarks/build_corpus.py",
@@ -571,6 +1348,7 @@
     "gcc": "gcc (Debian 16.2.0-3) 16.2.0",
     "mingw": "x86_64-w64-mingw32-gcc (GCC) 16-win32",
     "smali": "smali 2.5.2.git2771eae-debian (http://smali.org)",
-    "upx": "upx 4.2.4"
+    "upx": "upx 4.2.4",
+    "windres": "GNU windres (GNU Binutils) 2.47"
   }
 }

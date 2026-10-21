@@ -1,9 +1,15 @@
+import gzip
+import io
 import json
+import os
 import shlex
 import stat
+import struct
 import tempfile
 import time
 import unittest
+import zipfile
+import zlib
 from pathlib import Path
 from unittest.mock import patch
 
@@ -52,6 +58,310 @@ class ServerHelperTests(unittest.TestCase):
             self.assertIsNone(result["rc"])
             self.assertFalse(marker.exists(), "a timed-out child survived its process group")
 
+    def test_ilspy_decompile_uses_token_argv_and_retains_full_source(self):
+        completed = {
+            "rc": 0, "stdout": "private static string Secret() => \"password=hunter2\";",
+            "stderr": "", "seconds": 0.1, "timed_out": False,
+            "cancelled": False, "crashed": False, "termination_signal": None,
+            "output_limited": False,
+        }
+        with tempfile.TemporaryDirectory() as td:
+            work = Path(td) / "work"
+            samples = work / "samples"
+            out = work / "out"
+            sample = samples / "original" / "sample"
+            sample.parent.mkdir(parents=True)
+            sample.write_bytes(b"managed fixture")
+            with (
+                patch.object(server, "WORK", work),
+                patch.object(server, "SAMPLES", samples),
+                patch.object(server, "OUT", out),
+                patch.object(server, "ILSPY_BIN", "ilspy-test"),
+                patch.object(server, "_run", return_value=completed) as run,
+            ):
+                result = server.dotnet_decompile(
+                    "original/sample", method="0x06000001", timeout=61,
+                )
+
+            run.assert_called_once_with(
+                ["ilspy-test", str(sample), "--member", "0x06000001"],
+                timeout=61,
+                max_output_bytes=8 * 1024 * 1024,
+            )
+            self.assertNotIn("hunter2", result["source_preview"])
+            self.assertIn("hunter2", Path(result["saved_to"]).read_text())
+            self.assertEqual(result["tool_version"], server.ILSPY_VERSION)
+
+        with self.assertRaisesRegex(ValueError, "MethodDef token"):
+            server.dotnet_decompile("anything", method="--project")
+        with self.assertRaisesRegex(ValueError, "type_name"):
+            server.dotnet_decompile("anything", type_name="--help")
+
+    def test_dotnet_inventory_maps_method_tokens_to_types_and_pages(self):
+        documents = {
+            "Assembly": {"rowCount": 1, "rows": [{"Name": "Fixture"}]},
+            "Module": {"rowCount": 1, "rows": [{"Name": "Fixture.dll"}]},
+            "AssemblyRef": {"rowCount": 0, "rows": []},
+            "TypeDef": {"rowCount": 2, "rows": [
+                {"RID": 1, "Token": "0x02000001", "Name": "<Module>",
+                 "Namespace": "", "MethodList": "1"},
+                {"RID": 2, "Token": "0x02000002", "Name": "Program",
+                 "Namespace": "Fixture", "MethodList": "1"},
+            ]},
+            "MethodDef": {"rowCount": 2, "rows": [
+                {"RID": 1, "Token": "0x06000001", "Name": "Alpha", "RVA": "0x2050"},
+                {"RID": 2, "Token": "0x06000002", "Name": "Beta", "RVA": "0x2060"},
+            ]},
+        }
+
+        def table(_target, name, _timeout):
+            return documents[name], None
+
+        with tempfile.TemporaryDirectory() as td:
+            out = Path(td) / "out"
+            with (
+                patch.object(server, "OUT", out),
+                patch.object(server, "_dotnet_target", return_value=Path("/work/sample")),
+                patch.object(server, "_dotnet_characteristics", return_value={"mixed_mode": False}),
+                patch.object(server, "_ilspy_table", side_effect=table),
+            ):
+                result = server.dotnet_inventory("sample", query="beta", limit=10)
+
+            self.assertTrue(Path(result["saved_to"]).is_file())
+
+        self.assertEqual(result["methods"]["matched"], 1)
+        self.assertEqual(result["methods"]["items"][0]["Token"], "0x06000002")
+        self.assertEqual(result["methods"]["items"][0]["DeclaringType"], "Fixture.Program")
+
+    def test_document_vba_uses_pinned_static_cli_and_retains_full_json(self):
+        completed = {
+            "rc": 0,
+            "stdout": json.dumps([
+                {"type": "MetaInformation", "version": server.OLETOOLS_VERSION},
+                {
+                    "type": "OpenXML",
+                    "analysis": [{"type": "Suspicious", "keyword": "AutoOpen"}],
+                    "code_deobfuscated": "password=hunter2",
+                    "macros": [{"vba_filename": "Module1.bas", "code": "Sub AutoOpen()"}],
+                },
+            ]),
+            "stderr": "", "seconds": 0.1, "timed_out": False,
+            "cancelled": False, "crashed": False,
+            "termination_signal": None, "output_limited": False,
+            "status": "ok",
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary) / "sample"
+            target.write_bytes(b"PK\x03\x04fixture")
+            out = Path(temporary) / "out"
+            with (
+                patch.object(server, "OUT", out),
+                patch.object(
+                    server, "_document_target",
+                    return_value=(target, {"format": "ooxml-word"}),
+                ),
+                patch.object(server, "OLEVBA_BIN", "olevba-test"),
+                patch.object(server, "_run", return_value=completed) as run,
+            ):
+                result = server.document_vba("sample", timeout=91)
+
+            run.assert_called_once_with(
+                [
+                    server.sys.executable, "-m", "blackwall_lab.documents",
+                    "vba-analyze", str(target), "--olevba-bin", "olevba-test",
+                ],
+                timeout=91,
+                max_output_bytes=server.MAX_DOCUMENT_OUTPUT,
+            )
+            retained = Path(result["saved_to"]).read_text()
+        self.assertEqual(result["macro_count"], 1)
+        self.assertEqual(result["tool_version"], server.OLETOOLS_VERSION)
+        self.assertNotIn("hunter2", str(result))
+        self.assertIn("hunter2", retained)
+
+    def test_document_extraction_registers_only_verified_generated_artifacts(self):
+        completed = {
+            "rc": 0, "stdout": "", "stderr": "", "seconds": 0.1,
+            "timed_out": False, "cancelled": False, "crashed": False,
+            "termination_signal": None, "output_limited": False, "status": "ok",
+        }
+        payload = b"BLACKWALL_INERT_DOCUMENT_CHILD"
+        digest = server.hashlib.sha256(payload).hexdigest()
+
+        def worker(command, _timeout):
+            output_dir = Path(command[2])
+            output_dir.joinpath("artifact-0000.bin").write_bytes(payload)
+            return ({
+                "schema": "blackwall.document-extraction.v1",
+                "artifacts": [{
+                    "file": "artifact-0000.bin", "size": len(payload),
+                    "sha256": digest, "kind": "ooxml-active-part",
+                    "source": "word/embeddings/child.bin",
+                }],
+            }, completed)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary) / "sample"
+            target.write_bytes(b"PK\x03\x04fixture")
+            out = Path(temporary) / "out"
+            registration = {
+                "path": f"/work/samples/derived/{digest}",
+                "sha256": digest,
+                "relationship": "document-embedded-artifact",
+            }
+            with (
+                patch.object(server, "OUT", out),
+                patch.object(
+                    server, "_document_target",
+                    return_value=(target, {"format": "ooxml-word"}),
+                ),
+                patch.object(server, "_worker_json", side_effect=worker),
+                patch.object(server, "_register_derived", return_value=registration) as register,
+                patch.object(server, "_run", return_value={"stdout": "ASCII text"}),
+            ):
+                result = server.document_extract_artifacts("sample")
+
+        self.assertEqual(result["count"], 1)
+        self.assertEqual(result["artifacts"][0]["sha256"], digest)
+        self.assertEqual(
+            register.call_args.kwargs["relationship"],
+            "document-embedded-artifact",
+        )
+        self.assertEqual(
+            register.call_args.kwargs["producer_tool"],
+            "lab.document_extract_artifacts",
+        )
+
+    def test_recursive_unpack_routes_children_and_preserves_lineage(self):
+        payload = json.dumps({
+            "endpoint": "https://recursive.fixture.invalid/api",
+            "campaign": "recursive-inert",
+        }, sort_keys=True, separators=(",", ":")).encode()
+        config = (
+            b"BWCFG1\0" + struct.pack("<I", len(payload)) + payload
+            + struct.pack("<I", zlib.crc32(payload) & 0xFFFFFFFF)
+        )
+        stream = io.BytesIO()
+        with zipfile.ZipFile(stream, "w") as archive:
+            archive.writestr("layers/config.gz", gzip.compress(config, mtime=0))
+
+        with tempfile.TemporaryDirectory() as temporary:
+            work = Path(temporary) / "work"
+            samples = work / "samples"
+            original = samples / "original"
+            derived = samples / "derived"
+            out = work / "out"
+            original.mkdir(parents=True)
+            digest = server.hashlib.sha256(stream.getvalue()).hexdigest()
+            target = original / digest
+            target.write_bytes(stream.getvalue())
+            target.chmod(0o444)
+            (original / ".meta.json").write_text(json.dumps({
+                "sha256": digest, "original_name": "nested.zip",
+            }))
+            with (
+                patch.object(server, "WORK", work),
+                patch.object(server, "SAMPLES", samples),
+                patch.object(server, "DERIVED", derived),
+                patch.object(server, "OUT", out),
+                patch.dict(os.environ, {
+                    "PYTHONPATH": str(Path(__file__).resolve().parents[1]),
+                }),
+            ):
+                result = server.recursive_unpack(
+                    f"original/{digest}", max_depth=3, max_artifacts=8,
+                    max_artifact_bytes=1024 * 1024,
+                    max_expanded_bytes=4 * 1024 * 1024,
+                    max_elapsed_seconds=30,
+                )
+
+        self.assertEqual(result["counts"]["artifacts"], 2)
+        self.assertEqual(result["counts"]["configuration_matches"], 1)
+        self.assertEqual(result["stop_reason"], "complete")
+        self.assertTrue(all(row["route"]["plan_id"] for row in result["artifacts"]))
+        self.assertEqual(
+            {row["lineage"]["lineage_depth"] for row in result["artifacts"]},
+            {1, 2},
+        )
+
+    def test_auto_script_language_uses_router_evidence_not_content_addressed_name(self):
+        self.assertEqual(
+            server._worker_script_language("auto", {"format": "powershell"}),
+            "powershell",
+        )
+        self.assertEqual(
+            server._worker_script_language("javascript", {"format": "powershell"}),
+            "javascript",
+        )
+
+    def test_dotnet_call_references_and_literal_search_are_method_bounded(self):
+        index = {
+            "method_rows": [
+                {"Token": "0x06000001", "Name": "Caller", "DeclaringType": "Fixture.Program"},
+                {"Token": "0x06000002", "Name": "Target", "DeclaringType": "Fixture.Program"},
+            ],
+            "method_count": 2,
+            "indexed_count": 2,
+            "index_truncated": False,
+            "saved_to": "/work/out/ilspy.json",
+            "methods": [
+                {
+                    "token": "0x06000001", "declaring_type": "Fixture.Program",
+                    "name": "Caller", "rva": "0x2050",
+                    "body": 'IL_0000: ldstr "needle"\nIL_0005: call void Fixture.Program::Target()',
+                    "calls": [{"offset": "IL_0005", "opcode": "call", "target": "void Fixture.Program::Target()"}],
+                },
+                {
+                    "token": "0x06000002", "declaring_type": "Fixture.Program",
+                    "name": "Target", "rva": "0x2070", "body": "IL_0000: ret",
+                    "calls": [],
+                },
+            ],
+        }
+        with tempfile.TemporaryDirectory() as td:
+            with (
+                patch.object(server, "OUT", Path(td)),
+                patch.object(server, "_dotnet_target", return_value=Path("/work/sample")),
+                patch.object(server, "_dotnet_il_index", return_value=(index, None)),
+            ):
+                references = server.dotnet_call_references(
+                    "sample", "0x06000002", direction="both",
+                )
+                search = server.dotnet_search("sample", "needle")
+
+            self.assertTrue(Path(references["saved_to"]).is_file())
+            self.assertTrue(Path(search["saved_to"]).is_file())
+
+        self.assertEqual(references["incoming_total"], 1)
+        self.assertEqual(references["incoming"][0]["from_token"], "0x06000001")
+        self.assertEqual(search["matched_methods"], 1)
+        self.assertEqual(search["matches"][0]["token"], "0x06000001")
+
+    def test_il_method_parser_prefers_rva_and_owner_over_ambiguous_names(self):
+        rows = [
+            {"Token": "0x06000001", "Name": "Run", "RVA": "0x2050",
+             "DeclaringType": "First.Program"},
+            {"Token": "0x06000002", "Name": "Run", "RVA": "0x2070",
+             "DeclaringType": "Second.Program"},
+        ]
+        il = """
+.method private static void Run () cil managed
+{
+  // Method begins at RVA 0x2070
+  IL_0000: ret
+} // end of method Program::Run
+.method private static void Run () cil managed
+{
+  // Method begins at RVA 0x2050
+  IL_0000: ret
+} // end of method Program::Run
+"""
+        parsed = server._parse_il_methods(il, rows, 10)
+        self.assertEqual(
+            [method["token"] for method in parsed],
+            ["0x06000002", "0x06000001"],
+        )
+
     def test_secret_redaction(self):
         text = "= password hunter2\nAuthorization eyJaaaaaaaaaaaaaaaaaaaa.bbbbbbbbbb.cccccccccc"
         redacted, count = server._redact_text(text)
@@ -98,8 +408,34 @@ class ServerHelperTests(unittest.TestCase):
         self.assertIn("trace-native-values", server.REA_NATIVE_COMMANDS)
         self.assertNotIn("inspect-desktop-application", commands)
         self.assertNotIn("inspect-il2cpp-metadata", commands)
-        self.assertNotIn("inspect-binary-layout", commands)
-        self.assertNotIn("inspect-recorded-crash", commands)
+        self.assertIn("inspect-binary-layout", commands)
+        self.assertIn("inspect-recorded-crash", commands)
+        self.assertEqual(server.REA_UNADVERTISED_OPTIONAL_COMMANDS, {
+            "inspect-desktop-application", "inspect-il2cpp-metadata",
+        })
+
+    def test_rea_pwntools_wrappers_use_only_static_exact_commands(self):
+        target = Path("/work/samples/original/input")
+        with (
+            patch.object(server, "_sample", return_value=target),
+            patch.object(server, "_original_name_for", return_value=None),
+            patch.object(server, "detect_format", return_value={"format": "elf"}),
+            patch.object(server, "_rea_run", return_value={"ok": True}) as run,
+        ):
+            server.rea_elf_layout("original/input", timeout=77)
+            run.assert_called_once_with(
+                target, "elf_layout", ["inspect-binary-layout", str(target)], 77,
+            )
+        with (
+            patch.object(server, "_sample", return_value=target),
+            patch.object(server, "_original_name_for", return_value=None),
+            patch.object(server, "detect_format", return_value={"format": "elf-core"}),
+            patch.object(server, "_rea_run", return_value={"ok": True}) as run,
+        ):
+            server.rea_recorded_crash("original/input", timeout=78)
+            run.assert_called_once_with(
+                target, "recorded_crash", ["inspect-recorded-crash", str(target)], 78,
+            )
 
     def test_rea_static_analysis_uses_argument_vector_and_saves_full_evidence(self):
         with tempfile.TemporaryDirectory() as td:

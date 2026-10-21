@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import selectors
 import shutil
 import signal
 import subprocess
@@ -63,6 +64,7 @@ def run_bounded(
     shell: bool = False,
     cancel_event: CancellationEvent | None = None,
     poll_interval: float = 0.1,
+    max_output_bytes: int | None = None,
 ) -> dict:
     """Run a command with whole-process-group timeout and cancellation.
 
@@ -73,6 +75,19 @@ def run_bounded(
     """
     if timeout <= 0:
         raise ValueError("timeout must be positive")
+    if max_output_bytes is not None and max_output_bytes <= 0:
+        raise ValueError("max_output_bytes must be positive")
+    if max_output_bytes is not None:
+        return _run_output_capped(
+            cmd,
+            timeout=timeout,
+            cwd=cwd,
+            shell=shell,
+            cancel_event=cancel_event,
+            poll_interval=poll_interval,
+            max_output_bytes=max_output_bytes,
+        )
+
     started = time.monotonic()
     deadline = started + timeout
     # Only the explicit expert MCP tool chooses a shell; all other callers use argv.
@@ -122,6 +137,125 @@ def run_bounded(
         raise
 
 
+def _run_output_capped(
+    cmd: list[str] | str,
+    *,
+    timeout: float,
+    cwd: Path,
+    shell: bool,
+    cancel_event: CancellationEvent | None,
+    poll_interval: float,
+    max_output_bytes: int,
+) -> dict:
+    """Run a child while bounding its combined stdout/stderr in memory.
+
+    The child is stopped as soon as the cap is crossed. Pipes are drained
+    incrementally so a parser cannot deadlock on a full pipe or make the MCP
+    process retain an unbounded response before its wall-clock deadline.
+    """
+    started = time.monotonic()
+    deadline = started + timeout
+    process = subprocess.Popen(
+        cmd,
+        cwd=cwd,
+        shell=shell,  # nosec B602
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=False,
+        executable="/bin/bash" if shell else None,
+        start_new_session=True,
+    )
+    if process.stdout is None or process.stderr is None:  # pragma: no cover
+        raise RuntimeError("parser output pipes were not created")
+
+    selector = selectors.DefaultSelector()
+    selector.register(process.stdout, selectors.EVENT_READ, "stdout")
+    selector.register(process.stderr, selectors.EVENT_READ, "stderr")
+    buffers = {"stdout": bytearray(), "stderr": bytearray()}
+    total = 0
+    timed_out = cancelled = output_limited = False
+
+    try:
+        while selector.get_map():
+            if cancel_event is not None and cancel_event.is_set():
+                cancelled = True
+            elif time.monotonic() >= deadline:
+                timed_out = True
+
+            if timed_out or cancelled or output_limited:
+                if process.poll() is None:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+
+            wait_for = min(max(poll_interval, 0.01), max(0.0, deadline - time.monotonic()))
+            events = selector.select(wait_for if process.poll() is None else 0)
+            if not events and process.poll() is not None:
+                # A final non-blocking read observes EOF and unregisters both
+                # streams even if process exit raced with selector readiness.
+                events = [(key, selectors.EVENT_READ) for key in selector.get_map().values()]
+            for key, _ in events:
+                try:
+                    chunk = os.read(key.fd, 64 * 1024)
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                remaining = max_output_bytes - total
+                if remaining > 0:
+                    buffers[key.data].extend(chunk[:remaining])
+                total += len(chunk)
+                if total > max_output_bytes:
+                    output_limited = True
+
+        process.wait()
+    except BaseException:
+        if process.poll() is None:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                process.wait(timeout=0.5)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.wait()
+        raise
+    finally:
+        selector.close()
+        process.stdout.close()
+        process.stderr.close()
+
+    stdout = bytes(buffers["stdout"]).decode("utf-8", errors="replace")
+    stderr = bytes(buffers["stderr"]).decode("utf-8", errors="replace")
+    if output_limited:
+        message = f"combined output exceeded {max_output_bytes} bytes"
+        stderr = f"{stderr.rstrip()}\n{message}" if stderr else message
+    elif timed_out:
+        message = f"timed out after {timeout:g}s"
+        stderr = f"{stderr.rstrip()}\n{message}" if stderr else message
+    elif cancelled:
+        message = "cancelled by caller"
+        stderr = f"{stderr.rstrip()}\n{message}" if stderr else message
+    result = _result(
+        process,
+        started,
+        stdout,
+        stderr,
+        timed_out=timed_out,
+        cancelled=cancelled,
+        output_limited=output_limited,
+    )
+    result["captured_output_bytes"] = min(total, max_output_bytes)
+    result["observed_output_bytes"] = total
+    return result
+
+
 def _result(
     process: subprocess.Popen[str],
     started: float,
@@ -130,8 +264,9 @@ def _result(
     *,
     timed_out: bool = False,
     cancelled: bool = False,
+    output_limited: bool = False,
 ) -> dict:
-    return_code = None if timed_out or cancelled else process.returncode
+    return_code = None if timed_out or cancelled or output_limited else process.returncode
     termination_signal = (
         -return_code if isinstance(return_code, int) and return_code < 0 else None
     )
@@ -140,6 +275,8 @@ def _result(
         status = "timeout"
     elif cancelled:
         status = "cancelled"
+    elif output_limited:
+        status = "output_limit"
     elif crashed:
         status = "crashed"
     elif return_code == 0:
@@ -153,6 +290,7 @@ def _result(
         "seconds": round(time.monotonic() - started, 1),
         "timed_out": timed_out,
         "cancelled": cancelled,
+        "output_limited": output_limited,
         "crashed": crashed,
         "termination_signal": termination_signal,
         "status": status,

@@ -10,8 +10,11 @@ from unittest.mock import patch
 
 from blackwall_lab import router, server
 
+ROOT = Path(__file__).resolve().parents[2]
 
-def pe_fixture(*, dotnet: bool = False, marker: bytes = b"") -> bytes:
+
+def pe_fixture(*, dotnet: bool = False, corflags: int | None = 0x1,
+               marker: bytes = b"") -> bytes:
     data = bytearray(1024)
     data[:2] = b"MZ"
     struct.pack_into("<I", data, 0x3C, 0x80)
@@ -22,6 +25,12 @@ def pe_fixture(*, dotnet: bool = False, marker: bytes = b"") -> bytes:
     if dotnet:
         clr_directory = 0x98 + 112 + 14 * 8
         struct.pack_into("<II", data, clr_directory, 0x2000, 0x48)
+        if corflags is not None:
+            struct.pack_into("<H", data, 0x86, 1)
+            section = 0x80 + 24 + 0xF0
+            data[section:section + 8] = b".text\0\0\0"
+            struct.pack_into("<IIII", data, section + 8, 0x200, 0x2000, 0x200, 0x200)
+            struct.pack_into("<I", data, 0x200 + 16, corflags)
     data.extend(marker)
     return bytes(data)
 
@@ -32,6 +41,22 @@ def zip_fixture(*names: str) -> bytes:
         for name in names:
             archive.writestr(name, b"inert fixture")
     return output.getvalue()
+
+
+def cab_fixture(payload: bytes = b"inert") -> bytes:
+    name = b"fixture.bin\0"
+    files_offset = 44
+    data_offset = files_offset + 16 + len(name)
+    cabinet_size = data_offset + 8 + len(payload)
+    return (
+        struct.pack(
+            "<4sIIIII BB HHHHH", b"MSCF", 0, cabinet_size, 0,
+            files_offset, 0, 3, 1, 1, 1, 0, 0, 0,
+        )
+        + struct.pack("<IHH", data_offset, 1, 0)
+        + struct.pack("<IIHHHH", len(payload), 0, 0, 0, 0, 0) + name
+        + struct.pack("<IHH", 0, len(payload), len(payload)) + payload
+    )
 
 
 class RouterDetectionTests(unittest.TestCase):
@@ -119,6 +144,26 @@ class RouterDetectionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "packing_state"):
             router.detect_format(target, packing_state="maybe")
 
+    def test_pe_with_structural_cab_gets_automatic_recursive_route(self):
+        target = self.write("iexpress", pe_fixture(marker=cab_fixture()))
+        detection = router.detect_format(target)
+        self.assertEqual(detection["embedded"][0]["format"], "cab")
+        plan = router.build_analysis_plan(target)
+        recursive = next(
+            step for step in plan["selected"]
+            if step["tool"] == "lab.recursive_unpack"
+        )
+        self.assertEqual(recursive["state"], "ready")
+        self.assertIn("RCDATA", recursive["reason"])
+
+    def test_mixed_mode_corflags_are_detected_without_widening_reads(self):
+        target = ROOT / "benchmarks" / "fixtures" / "dotnet-mixed.pe"
+        detection = router.detect_format(target)
+        self.assertEqual(detection["format"], "dotnet")
+        self.assertTrue(detection["managed"]["mixed_mode"])
+        self.assertFalse(detection["managed"]["il_only"])
+        self.assertIn("mixed managed/native", " ".join(detection["evidence"]))
+
 
 class RouterPlanTests(unittest.TestCase):
     def setUp(self):
@@ -176,7 +221,19 @@ class RouterPlanTests(unittest.TestCase):
         selected = {step["tool"] for step in plan["selected"]}
         self.assertNotIn("lab.capa", selected)
         self.assertNotIn("lab.floss", selected)
+        self.assertIn("lab.macho_info", selected)
         self.assertIn("ghidra.list_project_binaries", selected)
+
+    def test_elf_core_routes_to_recorded_crash_without_native_execution(self):
+        core = bytearray(b"\x7fELF\x02\x01\x01" + b"\0" * 121)
+        struct.pack_into("<H", core, 16, 4)
+        struct.pack_into("<H", core, 18, 0x3E)
+        plan = router.build_analysis_plan(self.write("core", bytes(core)))
+        self.assertEqual(plan["detection"]["format"], "elf-core")
+        selected = {step["tool"] for step in plan["selected"]}
+        self.assertIn("lab.rea_recorded_crash", selected)
+        self.assertNotIn("lab.emulate_elf", selected)
+        self.assertNotIn("ghidra.list_project_binaries", selected)
 
     def test_dotnet_prefers_managed_workflows_over_native_ghidra(self):
         plan = router.build_analysis_plan(self.write("managed", pe_fixture(dotnet=True)))
@@ -186,16 +243,40 @@ class RouterPlanTests(unittest.TestCase):
             if step["tool"] == "lab.rea_static_analysis"
         }
         self.assertEqual(workflows, {"managed", "managed_native_boundaries"})
-        self.assertIn("lab.rea_managed_members", {s["tool"] for s in plan["selected"]})
+        selected = {s["tool"]: s for s in plan["selected"]}
+        self.assertIn("lab.rea_managed_members", selected)
+        self.assertIn("lab.dotnet_inventory", selected)
+        self.assertIn("lab.dotnet_list_resources", selected)
+        self.assertIn("lab.dotnet_extract_resources", selected)
+        self.assertEqual(selected["lab.dotnet_decompile"]["state"], "deferred")
+        self.assertEqual(selected["lab.dotnet_call_references"]["state"], "deferred")
+        self.assertEqual(selected["lab.dotnet_search"]["state"], "deferred")
         self.assertTrue(any(
             item["tool"] == "ghidra.list_project_binaries" for item in plan["skipped"]
         ))
+
+    def test_mixed_mode_dotnet_adds_focused_native_workspace(self):
+        plan = router.build_analysis_plan(
+            ROOT / "benchmarks" / "fixtures" / "dotnet-mixed.pe",
+        )
+        selected = {step["tool"]: step for step in plan["selected"]}
+        self.assertIn("lab.dotnet_inventory", selected)
+        self.assertIn("ghidra.list_project_binaries", selected)
+        self.assertEqual(selected["lab.rea_native_function"]["state"], "deferred")
+
+    def test_unknown_dotnet_corflags_keep_a_conservative_native_workspace(self):
+        plan = router.build_analysis_plan(
+            self.write("managed-unknown", pe_fixture(dotnet=True, corflags=None)),
+        )
+        selected = {step["tool"]: step for step in plan["selected"]}
+        self.assertIn("ghidra.list_project_binaries", selected)
+        self.assertIn("unavailable", selected["ghidra.list_project_binaries"]["reason"])
 
     def test_focused_formats_select_focused_rea_workflows(self):
         cases = [
             (
                 "apk", zip_fixture("AndroidManifest.xml", "classes.dex"),
-                "lab.rea_static_analysis", ("workflow", "android"),
+                "lab.android_resources", ("timeout", 600),
             ),
             (
                 "electron", b"const {app} = require('electron'); function f(){}",
@@ -239,6 +320,8 @@ class RouterPlanTests(unittest.TestCase):
         self.assertFalse(any(
             step["tool"] == "lab.rea_static_analysis" for step in plan["selected"]
         ))
+        self.assertIn("lab.script_analyze", {step["tool"] for step in plan["selected"]})
+        self.assertIn("lab.script_extract_payloads", {step["tool"] for step in plan["selected"]})
         self.assertTrue(any(
             item["tool"] == "lab.rea_static_analysis"
             and item.get("arguments", {}).get("workflow") == "javascript"
@@ -264,16 +347,34 @@ class RouterPlanTests(unittest.TestCase):
             "deferred",
         )
 
-    def test_document_embedded_scan_waits_for_suspicious_evidence(self):
+    def test_document_uses_bounded_structure_and_extraction_tools(self):
         plan = router.build_analysis_plan(
             self.write("document.pdf", b"%PDF-1.7\n%%EOF"),
         )
-        scan = next(
-            step for step in plan["selected"]
-            if step["tool"] == "lab.binwalk_scan"
-        )
-        self.assertEqual(scan["state"], "deferred")
-        self.assertIn("inputs_required", scan)
+        selected = {step["tool"]: step for step in plan["selected"]}
+        self.assertEqual(selected["lab.document_triage"]["state"], "ready")
+        self.assertEqual(selected["lab.document_extract_artifacts"]["state"], "ready")
+        self.assertNotIn("lab.binwalk_scan", selected)
+        self.assertTrue(any(
+            item["tool"] == "lab.document_vba" and "not an OLE" in item["reason"]
+            for item in plan["skipped"]
+        ))
+
+    def test_vba_powershell_and_vbscript_route_to_static_script_tools(self):
+        cases = {
+            "vba": (b'Attribute VB_Name = "Fixture"\nSub AutoOpen()\nEnd Sub', "fixture.bas"),
+            "powershell": (b'$env:Fixture = "x"', "fixture.ps1"),
+            "vbscript": (b'On Error Resume Next\nvalue = "x"', "fixture.vbs"),
+        }
+        for expected, (data, name) in cases.items():
+            with self.subTest(expected=expected):
+                plan = router.build_analysis_plan(self.write(name, data))
+                self.assertEqual(plan["detection"]["format"], expected)
+                selected = {step["tool"]: step for step in plan["selected"]}
+                self.assertEqual(
+                    selected["lab.script_analyze"]["arguments"]["language"], expected,
+                )
+                self.assertIn("lab.script_extract_payloads", selected)
 
     def test_native_electron_wrapper_keeps_ghidra_and_adds_fuse_inspection(self):
         plan = router.build_analysis_plan(
@@ -297,6 +398,9 @@ class RouterPlanTests(unittest.TestCase):
             and item.get("arguments", {}).get("workflow") == "artifact"
             for item in plan["skipped"]
         ))
+        self.assertIn(
+            "lab.recursive_unpack", {step["tool"] for step in plan["selected"]},
+        )
 
     def test_unknown_format_records_unsupported_gap_instead_of_guessing(self):
         plan = router.build_analysis_plan(self.write("unknown", b"\x01\x02\x03\x04"))
@@ -313,6 +417,9 @@ class RouterPlanTests(unittest.TestCase):
             b"\x7fELF\x02\x01\x01" + b"\0" * 128,
             zip_fixture("AndroidManifest.xml", "classes.dex"),
             b"function f(){ return require('fs'); }",
+            b'$env:Fixture = "x"',
+            b'Attribute VB_Name = "Fixture"\nSub AutoOpen()\nEnd Sub',
+            b"%PDF-1.7\n%%EOF",
             b"\0asm\x01\0\0\0",
             b"SQLite format 3\0" + b"\0" * 80,
         ]
@@ -394,6 +501,18 @@ class ResultNormalizationTests(unittest.TestCase):
                 self.assertEqual(normalized["status"], expected)
                 self.assertTrue(normalized["continue_analysis"])
                 self.assertEqual(normalized["gap"]["kind"], expected)
+
+    def test_redundant_step_is_distinct_from_success_and_failure(self):
+        normalized = router.normalize_result(
+            "triage.step",
+            "lab.fixture",
+            result={"status": "not_run_redundant", "reason": "same evidence exists"},
+        )
+        self.assertEqual(normalized["status"], "not_run_redundant")
+        self.assertTrue(normalized["continue_analysis"])
+        self.assertIsNone(normalized["gap"])
+        self.assertTrue(normalized["observed"]["redundant"])
+        self.assertFalse(normalized["observed"]["has_evidence"])
 
     def test_success_has_no_gap_and_exception_is_failed(self):
         success = router.normalize_result(

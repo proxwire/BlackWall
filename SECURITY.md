@@ -50,6 +50,52 @@ Important limits:
 - Static parsers, decompilers, the container runtime, and the host kernel can
   still contain vulnerabilities. Use a dedicated analysis host or VM for
   samples outside your container threat model.
+- ILSpyCmd and its .NET runtime are pinned, checksum-verified, offline, and
+  wrapped by 256 MiB input, 4–16 MiB combined-output, 10–600 second, and 1 GiB
+  managed-heap limits. Output overflow terminates the complete parser process
+  group. Method selectors must be MethodDef tokens; resource names never
+  become output paths, and derived resource bytes receive content-addressed
+  lineage. These controls bound failure impact but do not make ILSpy or dnfile
+  memory-safe against hostile metadata.
+- The document lane pins `oletools==0.60.2` and every transitive wheel/sdist
+  hash. VBA and purpose-built document/script parsers run in supervised worker
+  processes with 128 MiB document/8 MiB script input ceilings, an 8 MiB output
+  ceiling, a 768 MiB address-space ceiling, wall deadlines, archive/member/
+  decoded-byte limits, and generated extraction names. The parent process
+  revalidates every artifact's path, size, and SHA-256 before lineage
+  registration. These controls do not make Python ZIP/XML/OLE parsing
+  memory-safe, turn the PDF scanner into a renderer, or detect all VBA
+  stomping, XLM, encrypted content, and runtime-only script behavior.
+- Android package/source analysis is provided by the checksum-verified
+  `jadx-headless-mcp` 0.7.1 bridge and its bundled JADX 1.5.6 engine. APK ZIP
+  names never become paths: selected resources receive generated names and
+  parent-process path/size/hash validation before lineage admission. Member,
+  per-resource, aggregate-byte, ratio, output, memory, and wall limits reduce
+  exposure but do not make JADX, Java ZIP parsing, or DEX decoding memory-safe.
+- Mach-O parsing and ELF emulation run in a supervised worker with a 256 MiB
+  input ceiling, 1.5 GiB address-space ceiling, descriptor/CPU/core limits, and
+  bounded output. Mach-O code-signature bytes are range-checked and hashed,
+  not trusted or notarization-verified. Unicorn maps at most 64 MiB of ELF
+  load segments, stops before syscalls, and receives no dynamic loader, host
+  filesystem, or network. It is emulation, not native sample execution.
+- REA's ELF layout/core adapter uses a separate hash-locked environment with
+  its exact pwntools 4.15.0, pyelftools 0.33, and Unicorn 2.1.2 profile. The
+  main BlackWall emulator stays on Unicorn 2.1.4. REA 6.7.0's absent desktop
+  and IL2CPP commands are checked but not exposed, preventing a documented
+  name from silently becoming an untested execution path.
+- Recursive extraction is breadth-first and independently bounded by depth,
+  artifact count, per-artifact size, aggregate expanded bytes, member count,
+  expansion ratio, and wall time. Traversing/absolute/control-byte names,
+  links, devices, and encrypted members are rejected; worker outputs use
+  generated names and are revalidated before lineage and rerouting. Content
+  hashes suppress repeated expansion and the lineage ledger rejects cycles.
+  These controls contain decompression bombs but do not make archive, CAB,
+  firmware, CPIO, or UPX parsers memory-safe.
+- Configuration extractors are statically registered reviewed package code;
+  sample bytes cannot select a module or executable plugin. Inputs and scalar
+  result maps are bounded, complete output stays in the case, and model-facing
+  values pass through secret redaction. A confidence grade describes an
+  extractor's validation evidence, not the sample's safety or attribution.
 - `--profile expert` deliberately restores scriptable shell/Python tools and
   radare2. In that profile the no-execution rule is a policy boundary: do not
   launch native samples. Speakeasy is API emulation, not native execution.

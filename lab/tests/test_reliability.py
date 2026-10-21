@@ -53,6 +53,19 @@ class ProcessSupervisionTests(unittest.TestCase):
         self.assertTrue(result["cancelled"])
         self.assertFalse(marker.exists())
 
+    def test_output_limit_stops_parser_without_retaining_unbounded_text(self):
+        result = reliability.run_bounded(
+            [sys.executable, "-c", "import sys; sys.stdout.write('x' * 200000)"],
+            timeout=2,
+            cwd=Path("/tmp"),
+            max_output_bytes=4096,
+        )
+        self.assertEqual(result["status"], "output_limit")
+        self.assertTrue(result["output_limited"])
+        self.assertIsNone(result["rc"])
+        self.assertLessEqual(len(result["stdout"].encode()), 4096)
+        self.assertIn("exceeded 4096 bytes", result["stderr"])
+
     @unittest.skipUnless(hasattr(os, "kill"), "requires POSIX signals")
     def test_parser_signal_crash_is_distinct_from_normal_failure(self):
         result = reliability.run_bounded(

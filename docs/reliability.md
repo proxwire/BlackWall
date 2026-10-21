@@ -29,6 +29,8 @@ down descendants if its own caller is interrupted. Results distinguish:
 - `timeout`: the command exceeded its wall-clock budget;
 - `cancelled`: the caller deliberately stopped pending work;
 - `crashed`: the parser terminated on a signal; and
+- `output_limit`: the parser crossed its operation-specific combined stdout/
+  stderr cap and its process group was stopped; and
 - `failed`: a normal nonzero exit without usable complete output.
 
 All are continuable normalized gaps. Stdio server bridges use the same group
@@ -75,6 +77,13 @@ CI exercises the production paths with inert data:
 | timeout | a delayed descendant is killed and cannot write its marker |
 | cancellation | EOF/cooperative cancellation kills the complete process group |
 | parser crash | signal termination is classified and the supervisor remains alive |
+| parser output overflow | retained stdout/stderr stays at the configured cap and the child is stopped |
+| .NET hostile-shape coverage | pinned ILSpy inventories/decompiles inert mixed-mode-marker, obfuscated, and resource-bearing fixtures under the production bounds |
+| document/script hostile-shape coverage | pinned oletools extracts a benign macro project; bounded workers recover external relationships, OOXML/RTF/PDF objects, deobfuscated scripts, and lineage-linked payloads without native interpreters |
+| Android/JADX coverage | the pinned bridge reports JADX 1.5.6, extracts generated-name resources with lineage, and decompiles one inert selected class without installing the APK |
+| native-format coverage | the exact REA pwntools profile parses ELF layout and a recorded core; Mach-O metadata/signature/Objective-C/Swift evidence and syscall-blocked Unicorn emulation pass their production workers |
+| recursive extraction | nested ZIP → uImage → CPIO and CAB fixtures preserve every parent edge, reroute each child, recover a graded config, and stop under graph budgets |
+| hostile archive names/bombs | traversal names and excessive expansion are rejected without materializing attacker-selected paths or exceeding caller byte budgets |
 | stale container | the container is replaced with the same named volume and no volume deletion |
 | full disk | an actually full tmpfs fails preflight while an evidence sentinel survives |
 | corrupt archive | validation fails, extraction scratch is removed, and retained evidence survives |

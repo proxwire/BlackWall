@@ -8,6 +8,7 @@ speakeasy-emulator==2.0.0b9
 pefile==2024.8.26
 lief==1.0.0
 dnfile==0.18.0
+oletools==0.60.2
 yara-python==4.5.4
 capstone==5.0.9
 unicorn==2.1.4

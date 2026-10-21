@@ -57,6 +57,40 @@ They use the same normalizer without a plan ID, supplying the content-addressed
 `artifact_path` and exact `command_arguments`. These standalone evidence
 records are auditable and claim-linkable but do not change a plan checkpoint.
 
+The .NET route follows the same contract. ILSpy inventory, resource listings,
+full bounded C#/CIL output, method search, and call-reference results expose a
+`saved_to` path that normalization copies into immutable content-addressed
+storage. Deferred method operations record their exact MethodDef token or
+literal as command arguments. `dotnet_extract_resources` also registers each
+blob as a child before returning it, so normalizing the planned extraction
+links both the tool output and every `dotnet-manifest-resource` lineage edge.
+
+The document/script route retains complete bounded worker or `olevba` JSON in
+the same way. Document parts record container member, OLE stream, RTF offset,
+or PDF object provenance; decoded script values record their transform and
+layer. `document_extract_artifacts` and `script_extract_payloads` validate
+generated temporary paths, size, and digest before registering
+`document-embedded-artifact` or `script-decoded-payload` edges. A recursively
+routed child therefore preserves both its byte identity and the exact static
+transformation that produced it.
+
+The Android/native lanes use the same retained-result contract. JADX package
+evidence and selected class/method source identify the canonical APK even when
+a content-addressed `.apk` staging name is required by the provider. Extracted
+manifest, resource, and asset bytes receive `android-resource` parent edges.
+Mach-O metadata and bounded ELF-emulation traces retain worker status and full
+bounded JSON, while REA ELF-layout and recorded-core results preserve their
+exact command and isolated-provider evidence.
+
+`recursive_unpack` additionally retains a versioned breadth-first graph. Every
+accepted member records its parent digest, extraction relationship, depth,
+generated derived path, and the deterministic format route calculated for that
+child. Content deduplication can suppress repeated expansion but never removes
+the already-recorded parent edge. Limit stops, unsupported layers, unsafe
+member names, codec gaps, parser failures, and registration rejections remain
+visible beside successful children. Configuration matches record their source
+artifact digest, byte locations, validation details, and graded confidence.
+
 ## Artifact lineage
 
 All built-in carving, unpacking, resource extraction, and emulation-dump tools

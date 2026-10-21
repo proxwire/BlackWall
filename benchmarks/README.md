@@ -9,11 +9,22 @@ offline harness used to compare three analysis lanes:
   manifest;
 - `hybrid`: the ready steps selected by BlackWall's deterministic router.
 
-The committed fixtures cover native PE, UPX-packed PE, .NET PE/CLI, ELF, APK,
-JavaScript, WASM, OOXML/Office, RTF, PDF, and PCAP. Every fixture is generated
-from source in this directory, contains stable `.invalid`/TEST-NET indicators,
-and performs no I/O or other behavior. Hashes and builder versions are locked
-in [`corpus/inert-manifest.json`](corpus/inert-manifest.json).
+The 26 committed fixtures cover native PE, UPX-packed PE, four .NET PE/CLI
+shapes (ordinary IL, a mixed-mode CorFlags marker, obfuscated identifiers, and
+an embedded resource), ELF, an ELF core, Mach-O, APK, JavaScript, PowerShell,
+VBScript, VBA source, WASM, ordinary and macro-enabled OOXML/Office, RTF, PDF,
+PCAP, nested firmware/archive layers, uncompressed and mixed-codec CAB,
+PE-embedded IExpress CAB, and inert graded configuration carriers (including a
+reconstructed Amadey v4/v5 shape).
+Document fixtures include external relationships, active content, and embedded
+payloads; script fixtures include inert concatenation, character-code,
+encoded-command, and Base64 shapes. The nested fixture follows ZIP → U-Boot
+uImage → newc CPIO so graph depth, rerouting, and lineage are measurable.
+Fixtures are generated from source in this directory, contain stable
+`.invalid`/TEST-NET indicators, and are never executed. The attributed
+XlsxWriter VBA example and its BSD-2-Clause notice are stored beside the
+sources. Hashes and builder versions are locked in
+[`corpus/inert-manifest.json`](corpus/inert-manifest.json).
 
 ## Run it
 
@@ -50,6 +61,18 @@ The committed 2026-10-20 image run is available as a
 [`Markdown summary`](../docs/benchmarks/cross-format-inert-2026-10-20.md) and
 [`machine-readable result`](../docs/benchmarks/cross-format-inert-2026-10-20.json).
 It is a reproducibility baseline, not a universal performance claim.
+The focused 2026-10-21 native/mobile/extraction run is likewise available as
+a [`Markdown summary`](../docs/benchmarks/native-extraction-inert-2026-10-21.md)
+and [`machine-readable result`](../docs/benchmarks/native-extraction-inert-2026-10-21.json).
+It covers ELF, APK, Mach-O, recorded-core, nested firmware, CAB, and graded
+configuration fixtures; the unsupported raw-REA CAB/config outcomes remain
+visible rather than being converted into successes.
+The separate
+[`same-sample operational comparison`](../docs/benchmarks/same-sample-strict-2026-10-21.md)
+records what changed between the initial unrestricted/expert-equivalent report
+and the current strict default on one real IExpress/Amadey sample. It contains
+only hashes and findings, not sample bytes, and is not a controlled model or
+timing benchmark.
 Operational failure-path coverage (readiness, cancellation, crashes, disk
 pressure, corrupt archives, and stale containers) is a separate admission
 suite documented in [`docs/reliability.md`](../docs/reliability.md).

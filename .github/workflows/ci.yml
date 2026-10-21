@@ -36,16 +36,20 @@ jobs:
           bash -n blackwall docker/bin/bw-ghidra-mcp docker/bin/bw-init \
             docker/bin/bw-intel-mcp docker/bin/bw-lab-mcp docker/bin/bw-r2mcp \
             docker/bin/bw-benchmark docker/bin/bw-ghidra-ready \
-            docker/bin/bw-reliability tests/test_image_reliability.sh \
+            docker/bin/bw-ilspy docker/bin/bw-reliability tests/test_image_reliability.sh \
             tests/test_reliability.sh
           shellcheck -e SC1091 blackwall docker/bin/bw-ghidra-mcp \
             docker/bin/bw-init docker/bin/bw-intel-mcp docker/bin/bw-lab-mcp \
             docker/bin/bw-r2mcp docker/bin/bw-benchmark docker/bin/bw-ghidra-ready \
-            docker/bin/bw-reliability tests/test_profiles.sh \
+            docker/bin/bw-ilspy docker/bin/bw-reliability tests/test_profiles.sh \
+            tests/test_case_management.sh \
             tests/test_reliability.sh tests/test_image_reliability.sh
           bash tests/test_profiles.sh
+          bash tests/test_case_management.sh
           bash tests/test_reliability.sh
           python3 scripts/check_dependency_exceptions.py --self-check
+          python3 scripts/generate_sbom.py --self-check
+          python3 scripts/update_dependency.py --self-check
           python3 -m compileall -q lab benchmarks scripts
           python3 benchmarks/build_corpus.py --verify
           PYTHONPATH=lab python3 -m blackwall_lab.benchmark --self-check
@@ -61,6 +65,12 @@ jobs:
             --generate-hashes --no-emit-index-url \
             --output-file lab/requirements.lock
           git diff --exit-code -- lab/requirements.lock
+          uv pip compile rea-runtime/pwntools-requirements.txt \
+            --output-file rea-runtime/pwntools-requirements.lock \
+            --generate-hashes --python-version 3.12 \
+            --python-platform x86_64-manylinux_2_39 \
+            --custom-compile-command 'uv pip compile rea-runtime/pwntools-requirements.txt --output-file rea-runtime/pwntools-requirements.lock --generate-hashes --python-version 3.12 --python-platform x86_64-manylinux_2_39'
+          git diff --exit-code -- rea-runtime/pwntools-requirements.lock
 
       - name: Audit dependencies
         run: |
@@ -69,6 +79,7 @@ jobs:
             --ignore-vuln PYSEC-2026-3813 \
             --ignore-vuln PYSEC-2026-3814 \
             --ignore-vuln PYSEC-2026-3815
+          pip-audit -r rea-runtime/pwntools-requirements.lock
           python3 scripts/check_dependency_exceptions.py --online
 
   image:
@@ -105,6 +116,8 @@ jobs:
           docker run --rm --network none blackwall:ci \
             bw-benchmark --self-check
           docker run --rm --network none blackwall:ci \
+            python -m blackwall_lab.extractors self-check
+          docker run --rm --network none blackwall:ci \
             bw-benchmark --mode plan --output /tmp/inert-plan
           docker run --rm --network none blackwall:ci python -m pip check
           docker run --rm blackwall:ci \
@@ -112,3 +125,7 @@ jobs:
           docker run --rm --network none blackwall:ci sh -c \
             '/opt/rea/runtime/node_modules/.bin/rea inspect-go-binary /bin/true --format json | jq -e . >/dev/null'
           bash tests/test_image_reliability.sh blackwall:ci
+          mkdir -p "${RUNNER_TEMP}/blackwall-sbom"
+          python3 scripts/generate_sbom.py \
+            --output-dir "${RUNNER_TEMP}/blackwall-sbom" --image blackwall:ci
+          python3 scripts/generate_sbom.py --verify "${RUNNER_TEMP}/blackwall-sbom"/*.json

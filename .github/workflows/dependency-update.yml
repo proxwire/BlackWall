@@ -1,0 +1,105 @@
+name: Controlled dependency update
+
+"on":
+  workflow_dispatch:
+    inputs:
+      ecosystem:
+        description: Locked dependency ecosystem
+        required: true
+        type: choice
+        options: [python, npm]
+      package:
+        description: Allowlisted direct dependency name
+        required: true
+        type: string
+      version:
+        description: Exact upstream version
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: dependency-update-${{ inputs.ecosystem }}-${{ inputs.package }}
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: true
+
+      - name: Install controlled update tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends jq python3-venv shellcheck
+          python3 -m venv "${RUNNER_TEMP}/blackwall-dependency-tools"
+          "${RUNNER_TEMP}/blackwall-dependency-tools/bin/pip" install \
+            --disable-pip-version-check uv==0.12.21
+          echo "${RUNNER_TEMP}/blackwall-dependency-tools/bin" >> "${GITHUB_PATH}"
+
+      - name: Apply allowlisted update and regenerate lock
+        env:
+          UPDATE_ECOSYSTEM: ${{ inputs.ecosystem }}
+          UPDATE_PACKAGE: ${{ inputs.package }}
+          UPDATE_VERSION: ${{ inputs.version }}
+        run: |
+          python3 scripts/update_dependency.py \
+            --ecosystem "$UPDATE_ECOSYSTEM" \
+            --package "$UPDATE_PACKAGE" \
+            --version "$UPDATE_VERSION" | tee /tmp/dependency-update.json
+
+      - name: Run source and full image fixture suites
+        run: |
+          bash -n blackwall docker/bin/bw-ghidra-mcp docker/bin/bw-init \
+            docker/bin/bw-intel-mcp docker/bin/bw-lab-mcp docker/bin/bw-r2mcp \
+            docker/bin/bw-benchmark docker/bin/bw-ghidra-ready \
+            docker/bin/bw-ilspy docker/bin/bw-reliability tests/*.sh
+          shellcheck -e SC1091 blackwall docker/bin/bw-ghidra-mcp \
+            docker/bin/bw-init docker/bin/bw-intel-mcp docker/bin/bw-lab-mcp \
+            docker/bin/bw-r2mcp docker/bin/bw-benchmark docker/bin/bw-ghidra-ready \
+            docker/bin/bw-ilspy docker/bin/bw-reliability tests/*.sh
+          bash tests/test_profiles.sh
+          bash tests/test_case_management.sh
+          bash tests/test_reliability.sh
+          python3 -m compileall -q lab benchmarks scripts
+          python3 benchmarks/build_corpus.py --verify
+          python3 scripts/generate_sbom.py --self-check
+          python3 scripts/update_dependency.py --self-check
+          docker build --build-arg UID="$(id -u)" --build-arg GID="$(id -g)" \
+            -t blackwall:dependency-update -f docker/Dockerfile .
+          docker run --rm --network none -e HOME=/tmp blackwall:dependency-update \
+            python -m unittest discover -v -s /opt/blackwall/lab/tests
+          docker run --rm --network none blackwall:dependency-update bw-benchmark --self-check
+          docker run --rm --network none blackwall:dependency-update \
+            python -m blackwall_lab.extractors self-check
+          bash tests/test_image_reliability.sh blackwall:dependency-update
+          docker run --rm blackwall:dependency-update npm audit --prefix /opt/rea/runtime --omit=dev
+
+      - name: Open reviewed dependency pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPDATE_ECOSYSTEM: ${{ inputs.ecosystem }}
+          UPDATE_PACKAGE: ${{ inputs.package }}
+          UPDATE_VERSION: ${{ inputs.version }}
+        run: |
+          base_branch=$(jq -r .branch /tmp/dependency-update.json)
+          [[ "$base_branch" =~ ^deps/[a-z0-9._+-]+-[a-z0-9._+-]+-[a-z0-9._+-]+$ ]]
+          branch="$base_branch-$GITHUB_RUN_ID"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$branch"
+          git add lab/requirements.txt lab/requirements.lock \
+            rea-runtime/package.json rea-runtime/package-lock.json
+          git diff --cached --check
+          git diff --cached --quiet && { echo "No dependency changes were produced"; exit 1; }
+          title="deps: update $UPDATE_PACKAGE to $UPDATE_VERSION"
+          git commit -m "$title"
+          git push origin "$branch"
+          gh pr create --base "$GITHUB_REF_NAME" --head "$branch" --title "$title" \
+            --body "Controlled $UPDATE_ECOSYSTEM update. Locks were regenerated and the complete inert image fixture suite passed."

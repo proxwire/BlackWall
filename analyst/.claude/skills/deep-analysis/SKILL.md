@@ -19,11 +19,36 @@ description: Systematic function-level reverse engineering of a (unpacked) malwa
   injection, or command dispatch. Feed useful conclusions back into the
   persistent Ghidra project; REA's temporary Ghidra project is not a substitute
   for BlackWall annotations.
-- For .NET and APK targets, use the focused `lab.rea_managed_members` or
-  `lab.rea_android_*` static tools to identify relevant types/methods and CIL
-  or source anchors before drilling down. Never call REA's runtime commands.
+- For .NET, use MethodDef tokens from `lab.dotnet_inventory`, locate relevant
+  bodies with `lab.dotnet_search`, map static callers/callees with
+  `lab.dotnet_call_references`, and send only selected tokens to
+  `lab.dotnet_decompile`. Use `lab.rea_managed_members` as an independent CIL
+  view and native-boundary cross-check. Reflection, delegates, and runtime
+  dispatch remain explicit gaps. For APK targets, start from
+  `lab.android_resources`, use `lab.rea_android_*` to identify relevant classes
+  and methods, then call `lab.android_decompile` for the selected Java/Kotlin
+  scope. Never call REA's runtime commands or install an APK.
+- For documents, pivot from `lab.document_triage` provenance into each
+  lineage-linked result from `lab.document_extract_artifacts`; use
+  `lab.document_vba` source/deobfuscation and relationships to connect macros,
+  commands, URLs, and dropped content. For scripts, prioritize high-severity
+  `lab.script_analyze` rules and decoded transform layers, then recursively
+  route children from `lab.script_extract_payloads`. Recovered text is static
+  evidence, not proof of execution.
+- For Mach-O, use `lab.macho_info` to seed dylib, import, Objective-C, and Swift
+  pivots into persistent Ghidra. Treat code-signature structure and hashes as
+  metadata, not trust verification. For ELF, use the exact-profile layout pass
+  as a static cross-check and invoke `lab.emulate_elf` only when the plan's
+  deferred justification is met. Its trace stops at syscalls and is not native
+  execution or a substitute for operating-system behavior.
 
 ## 2. Per function
+
+For IL-only .NET, substitute the token-selected `lab.dotnet_decompile` and
+`lab.dotnet_call_references` operations for the Ghidra steps below. Normalize
+their output and cite its evidence, but do not attempt Ghidra renames on CLR
+metadata. Mixed-mode plans expose Ghidra for the native half.
+
 1. `ghidra.decompile_function` (include callees/xrefs when useful).
 2. Work out its purpose, then **write it back**:
    - retain an unplanned decompile/trace with `lab.normalize_analysis_result`,

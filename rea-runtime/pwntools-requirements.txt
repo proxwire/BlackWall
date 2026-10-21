@@ -1,0 +1,6 @@
+# Exact caller-supplied profile required by REA 6.7.0's ELF layout and
+# recorded-core adapters. This is intentionally isolated from BlackWall's main
+# Python environment, which uses a newer Unicorn release.
+pwntools==4.15.0
+pyelftools==0.33
+unicorn==2.1.2

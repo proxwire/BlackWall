@@ -17,16 +17,20 @@ class BenchmarkCorpusTests(unittest.TestCase):
         manifest = benchmark.load_manifest(INERT_MANIFEST)
         fixtures = benchmark.resolve_fixtures(manifest)
 
-        self.assertEqual(len(fixtures), 11)
+        self.assertEqual(len(fixtures), 26)
         self.assertEqual({item[0]["id"] for item in fixtures}, {
-            "native-pe", "packed-pe", "dotnet", "elf", "apk", "javascript",
-            "wasm", "office", "rtf", "pdf", "pcap",
+            "native-pe", "packed-pe", "dotnet", "dotnet-mixed",
+            "dotnet-obfuscated", "dotnet-resource", "elf", "apk",
+            "javascript", "powershell", "vbscript", "vba-source", "wasm",
+            "office", "office-macro", "rtf", "pdf", "pcap",
+            "macho", "recorded-core", "nested-firmware", "installer-cab",
+            "installer-lzx", "iexpress-cab", "family-config", "amadey-config",
         })
         self.assertTrue(all(path.is_file() for _, path in fixtures))
 
         check = benchmark.benchmark_self_check(INERT_MANIFEST)
         self.assertTrue(check["ok"])
-        self.assertEqual(check["fixtures"], 11)
+        self.assertEqual(check["fixtures"], 26)
         self.assertEqual(check["lanes"], list(benchmark.LANES))
 
     def test_plan_records_all_lanes_without_making_execution_claims(self):
@@ -68,19 +72,40 @@ class BenchmarkCorpusTests(unittest.TestCase):
         ).hexdigest()[:16]
         self.assertNotEqual(changed_id, result["run_id"])
 
-    def test_core_binwalk_keeps_its_narrow_timeout(self):
+    def test_core_document_tools_replace_binwalk_with_bounded_deadlines(self):
         fixture = next(
             item
             for item in benchmark.load_manifest(INERT_MANIFEST)["fixtures"]
             if item["id"] == "office"
         )
-        binwalk = next(
-            step
-            for step in benchmark._core_steps(fixture, 300)
-            if step["tool"] == "lab.binwalk_scan"
+        steps = benchmark._core_steps(fixture, 300)
+        by_tool = {step["tool"]: step for step in steps}
+        self.assertNotIn("lab.binwalk_scan", by_tool)
+        self.assertEqual(by_tool["lab.document_triage"]["deadline_seconds"], 120)
+        self.assertEqual(by_tool["lab.document_triage"]["arguments"]["timeout"], 120)
+        self.assertEqual(by_tool["lab.document_vba"]["deadline_seconds"], 180)
+
+    def test_native_core_lane_stays_independent_from_rea(self):
+        manifest = benchmark.load_manifest(INERT_MANIFEST)
+        fixtures = {item["id"]: item for item in manifest["fixtures"]}
+
+        elf_tools = {
+            step["tool"] for step in benchmark._core_steps(fixtures["elf"], 300)
+        }
+        core_tools = {
+            step["tool"]
+            for step in benchmark._core_steps(fixtures["recorded-core"], 300)
+        }
+        apk_tools = {
+            step["tool"] for step in benchmark._core_steps(fixtures["apk"], 300)
+        }
+        self.assertIn("lab.emulate_elf", elf_tools)
+        self.assertFalse(any(tool.startswith("lab.rea_") for tool in elf_tools | core_tools))
+        self.assertNotIn("lab.android_resources", apk_tools)
+        self.assertEqual(
+            benchmark._raw_rea_steps(fixtures["recorded-core"], 300)[0]["tool"],
+            "lab.rea_recorded_crash",
         )
-        self.assertEqual(binwalk["deadline_seconds"], 30)
-        self.assertEqual(binwalk["arguments"]["timeout"], 30)
 
     def test_malware_manifest_is_hash_only_and_requires_opt_in(self):
         manifest = benchmark.load_manifest(MALWARE_MANIFEST)

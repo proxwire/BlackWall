@@ -4,6 +4,7 @@
 !rea-runtime/
 !rules/
 !benchmarks/
+!THIRD_PARTY_NOTICES.md
 lab/**/__pycache__
 benchmarks/**/__pycache__
 benchmarks/fixtures-src/dotnet/obj
